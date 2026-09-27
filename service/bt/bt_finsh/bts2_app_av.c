@@ -2183,7 +2183,6 @@ static void bt_av_hdl_conn_cfm(bts2_app_stru *bts2_app_data)
     msg = (BTS2S_AV_CONN_CFM *)bts2_app_data->recv_msg;
     if (msg->res != AV_ACPT)
     {
-        if ((msg->res != AV_DUPLICATE_CONNECTING) && (msg->res != AV_CONNECT_CONFLICT))
         {
             bt_notify_profile_state_info_t profile_state = {0};
             bt_addr_convert(&msg->bd, profile_state.mac.addr);
@@ -2255,6 +2254,16 @@ static void bt_av_hdl_conn_ind(bts2_app_stru *bts2_app_data)
         inst->con[i].idx = i;
         inst->con[i].st = avconned;
         bd_copy(&inst->con[i].av_rmt_addr, &msg->bd);
+#ifdef CFG_AV_SRC
+        /* Remote-opened AVDTP used to leave cfg at its init value
+         * (AV_AUDIO_NO_ROLE): the start confirmation then matched neither
+         * role, so the state never advanced to avconned_streaming and the
+         * sharing fan-out (st == avconned_streaming) sent zero packets —
+         * "connected with name but no sound" for every remote-opened
+         * link. We are the A2DP Source regardless of who opened the
+         * signaling channel. */
+        inst->con[i].cfg = AV_AUDIO_SRC;
+#endif
 
         INFO_TRACE("(d%d)URC av conn,ind\n", i);
 

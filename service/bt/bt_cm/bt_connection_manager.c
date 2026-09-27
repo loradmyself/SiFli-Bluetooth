@@ -204,14 +204,31 @@ void bt_cm_add_bonded_dev(bt_cm_dev_info_t *dev, uint8_t force)
 static uint8_t bt_cm_get_bond_info_from_flash()
 {
     uint8_t ret;
+    /* Read through a fixed NVDS-sized scratch buffer: a record written by
+     * a build with a larger BT_CM_MAX_BOND is bigger than this struct, and
+     * sifli_nvds_read() copies the whole stored length — copying it
+     * straight into g_bt_bonded_dev would overflow the BSS. */
+    static uint8_t raw[SIFLI_NVDS_KEY_LEN_BT_CM];
+    uint16_t len;
+    uint16_t copy_len;
 
     if (sizeof(g_bt_bonded_dev) > SIFLI_NVDS_KEY_LEN_BT_CM)
         RT_ASSERT(0);
 
-    uint16_t len = sizeof(g_bt_bonded_dev);
-    ret = sifli_nvds_read(SIFLI_NVDS_TYPE_BT_CM, &len, (uint8_t *)&g_bt_bonded_dev);
-
-    if (ret != NVDS_OK)
+    memset(&g_bt_bonded_dev, 0, sizeof(g_bt_bonded_dev));
+    len = SIFLI_NVDS_KEY_LEN_BT_CM;
+    ret = sifli_nvds_read(SIFLI_NVDS_TYPE_BT_CM, &len, raw);
+    if (ret == NVDS_OK)
+    {
+        copy_len = (len < sizeof(g_bt_bonded_dev)) ? len : sizeof(g_bt_bonded_dev);
+        memcpy(&g_bt_bonded_dev, raw, copy_len);
+        /* Truncated reads (older/smaller records) can leave last_bond_idx
+         * from stale bytes; the LRU always indexes with a modulo, but keep
+         * it well-formed anyway. */
+        if (g_bt_bonded_dev.last_bond_idx >= BT_CM_MAX_BOND)
+            g_bt_bonded_dev.last_bond_idx = 0;
+    }
+    else
     {
         LOG_E("read bt bonded failed!");
     }
@@ -979,6 +996,7 @@ int bt_cm_gap_event_handler(uint16_t event_id, uint8_t *msg)
         if (conn)
         {
             LOG_D("Encryption status updated for device: %06X:%02X:%04X, link_type: %d", ind->bd.lap, ind->bd.uap, ind->bd.nap, conn->info.link_type);
+            conn->encrypted = 1;
             bt_cm_add_bonded_dev(&conn->info, 1);
         }
         break;
@@ -1023,6 +1041,21 @@ static void bt_cm_hci_connect_request_event_hdl(BTS2S_DM_ACL_OPEN_IND *ind)
     if (bt_is_auto_request_connect())
     {
         bt_cm_dev_acl_info_t *conn = bt_cm_get_conn_by_addr(env, &ind->bd);
+
+        /* A remote that pages us WHILE an established ACL to it is up
+         * (observed: some TWS buds page continuously after a link drop)
+         * forces the controller into a duplicate-connection swap — the
+         * old ACL is killed with "connection already exists" (0x0B) and a
+         * new one appears, an endless churn that also wedges unrelated
+         * connects afterwards. Refuse the duplicate page; the
+         * established link stays clean. Racing pages while the ACL is
+         * still being created remain acceptable below. */
+        if (conn && (conn->state == BT_CM_ACL_STATE_CONNECTED))
+        {
+            LOG_I("refusing duplicate page; ACL already up");
+            hcia_send_rej_conn_request(&ind->bd, HCI_ERR_REJ_BY_RMT_NO_RES);
+            return;
+        }
 
         if (conn == NULL)
         {
@@ -1117,7 +1150,17 @@ static void bt_cm_hci_acl_disconnect_complete_event_hdl(BTS2S_DM_ACL_DISC_IND *i
 #endif
 
 #ifdef CFG_AV
-    a2dp_reset_req();
+    /* Reset the AV request state only when the disconnected device owns
+     * an AV instance. An unconditional reset cancels the PENDING AV
+     * connect of an unrelated headset — e.g. a forgotten headset's page
+     * is rejected and its ACL torn down while the second headset is
+     * mid-connect — killing that attempt ("a2dp connect failed 97") and
+     * making the second headset connect unreliably. */
+    if (bt_av_get_idx_from_addr(bt_av_get_inst_data(), &ind->cur_bd) <
+            MAX_CONNS)
+    {
+        a2dp_reset_req();
+    }
 #endif
 
 #ifdef CFG_AVRCP

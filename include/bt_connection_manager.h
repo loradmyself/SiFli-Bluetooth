@@ -125,6 +125,7 @@ typedef struct
     uint8_t link_status_update; // link mode update flag
     uint8_t link_mode;
     float   link_interval;
+    uint8_t encrypted; // link key verified (BTS2MU_GAP_ENCRYPTION_IND)
 } bt_cm_dev_acl_info_t;
 
 typedef struct
