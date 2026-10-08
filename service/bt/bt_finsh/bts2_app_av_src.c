@@ -455,6 +455,61 @@ int bt_avsrc_get_stream_conn(bts2s_av_inst_data *inst)
 
     return -1;
 }
+
+/* Per-connection media forwarding diagnostics for the shared sender.
+ * req   : payloads handed to av_stream_data_req() for this stream
+ * nomem : fan-out copies dropped because bmalloc() failed
+ * qos   : AV QOS indications seen for this stream (the AVDTP layer only
+ *         emits these while media actually moves through the stream)
+ * buff  : last reported stream buffer fullness (0 empty .. 10 full)
+ * A streaming connection whose req/qos counters stall while another
+ * connection advances has a wedged media path inside the AVDTP layer. */
+static U32 s_media_req[MAX_CONNS];
+static U32 s_media_nomem[MAX_CONNS];
+static U32 s_media_qos[MAX_CONNS];
+static U8 s_media_buff[MAX_CONNS];
+
+void bt_avsrc_note_qos(U16 shdl, U16 buff_st)
+{
+    bts2s_av_inst_data *inst = bt_av_get_inst_data();
+    U8 idx;
+
+    if (inst == NULL)
+    {
+        return;
+    }
+    idx = bt_av_get_idx_from_shdl(inst, (U8)shdl);
+    if (idx < MAX_CONNS)
+    {
+        s_media_qos[idx]++;
+        s_media_buff[idx] = (U8)((buff_st > 10U) ? 10U : buff_st);
+    }
+}
+
+BOOL bt_avsrc_get_media_stats(U8 idx, U32 *req, U32 *nomem, U32 *qos, U8 *buff)
+{
+    if (idx >= MAX_CONNS)
+    {
+        return FALSE;
+    }
+    if (req != NULL)
+    {
+        *req = s_media_req[idx];
+    }
+    if (nomem != NULL)
+    {
+        *nomem = s_media_nomem[idx];
+    }
+    if (qos != NULL)
+    {
+        *qos = s_media_qos[idx];
+    }
+    if (buff != NULL)
+    {
+        *buff = s_media_buff[idx];
+    }
+    return TRUE;
+}
 /*----------------------------------------------------------------------------*
  *
  * DESCRIPTION:
@@ -1432,6 +1487,11 @@ uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb)
                                                inst->time_stamp,
                                                pkt_len,
                                                stream_data); /**/
+                            s_media_req[i]++;
+                        }
+                        else
+                        {
+                            s_media_nomem[i]++;
                         }
                     }
                 }

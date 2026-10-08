@@ -954,8 +954,13 @@ int bt_cm_gap_event_handler(uint16_t event_id, uint8_t *msg)
 
             if (ind->mode == ACT_MODE && conn->link_status_update)
             {
+                /* Sniff is prohibited on this product's audio links (see
+                 * the link-policy write in bt_cm_hci_acl_connect_complete_
+                 * event_hdl). The old behaviour re-entered a 798-slot
+                 * sniff here after every forced exit — exactly the
+                 * "reconnect then silent" trap. Just acknowledge the
+                 * flag; never push the link back into Sniff. */
                 conn->link_status_update = 0;
-                hcia_sniff_mode(&ind->bd, BT_CM_SNIFF_INV, BT_CM_SNIFF_INV, BT_CM_SNIFF_ATTEMPT, BT_CM_SNIFF_TIMEOUT, NULL);
             }
 
             if (ind->mode == SNIFF_MODE && ind->st == HCI_SUCC)
@@ -987,6 +992,15 @@ int bt_cm_gap_event_handler(uint16_t event_id, uint8_t *msg)
         BTS2S_GAP_KEYMISSING_IND *ind;
         ind = (BTS2S_GAP_KEYMISSING_IND *)msg;
         bt_cm_delete_bonded_devs_and_linkkey_by_addr(&ind->bd);
+        /* The key is gone — this link can never encrypt now, and keeping
+         * it up parked the app in "AVDTP deferred; waiting for link
+         * encryption" for ~16s while the two bond tables stayed desynced
+         * (9-29 16:41 log). Drop the ACL so the reconnect flow starts a
+         * clean SSP re-pair immediately instead. */
+        if (bt_cm_get_conn_by_addr(env, &ind->bd) != NULL)
+        {
+            gap_disconnect_req(&ind->bd);
+        }
         break;
     }
     case BTS2MU_GAP_ENCRYPTION_IND:     //IOS手机先连接ble配对后再连接bt没有BTS2MU_SC_PAIR_IND事件，这个事件不能删除。
@@ -1013,7 +1027,13 @@ int bt_cm_gap_event_handler(uint16_t event_id, uint8_t *msg)
         break;
     }
     case BTS2MU_GAP_ROLE_SWITCH_CFM:
+    case BTS2MU_GAP_ROLE_SWITCH_IND:
     {
+        /* ROLE_SWITCH_IND has the same layout as ROLE_SWITCH_CFM: it
+         * carries the completion of a role change GAP did not track as
+         * its own pending request (e.g. a raw hcia_switch_role bypass,
+         * or the remote's own switch). Update the cached role from it
+         * just like the CFM — dropping it left info.role stale. */
         BTS2S_GAP_ROLE_SWITCH_CFM *ind = (BTS2S_GAP_ROLE_SWITCH_CFM *)msg;
         if (ind->res == HCI_SUCC)
         {
@@ -1022,6 +1042,10 @@ int bt_cm_gap_event_handler(uint16_t event_id, uint8_t *msg)
             {
                 conn->info.role = ind->role;
             }
+        }
+        else
+        {
+            LOG_W("role switch failed, res:%d, role:%d", ind->res, ind->role);
         }
         break;
     }
@@ -1067,7 +1091,7 @@ static void bt_cm_hci_connect_request_event_hdl(BTS2S_DM_ACL_OPEN_IND *ind)
             }
         }
 
-        hcia_send_acpt_conn_request(&ind->bd, BT_LINK_SLAVE);
+        hcia_send_acpt_conn_request(&ind->bd, bt_get_acpt_link_role());
     }
 
     bt_notify_device_conn_request_t conn_request;
@@ -1090,8 +1114,16 @@ static void bt_cm_hci_acl_connect_complete_event_hdl(BTS2S_DM_EN_ACL_OPENED_IND 
         conn->link_dir = ind->incoming;
         conn->state = BT_CM_ACL_STATE_CONNECTED;
         conn->info.is_reconn = bt_cm_get_reconnect_flag_by_role(conn->info.link_type);
-        hcia_wr_lp_settings_keep_sniff_interval(&ind->bd, HCI_LINK_POLICY_NO_CHANGE, BT_CM_SNIFF_ENTER_TIME,
-                                                BT_CM_SNIFF_INV, BT_CM_SNIFF_INV, BT_CM_SNIFF_ATTEMPT, BT_CM_SNIFF_TIMEOUT, NULL);
+        /* Audio link policy: role-switch ONLY — the SNIFF bit (0x0004) is
+         * deliberately cleared. The default keep-sniff_interval policy
+         * (5s idle -> 798-slot sniff) let the link slide into Sniff right
+         * after a headset reconnect, and the A2DP stream then went silent
+         * ("streaming but no audio"). With the bit cleared the LM refuses
+         * every Sniff entry — including the headset's own request. This
+         * product keeps audio links out of Sniff for their whole life;
+         * BT_CM_SNIFF_* constants stay defined but are no longer used
+         * here. */
+        hcia_wr_lp_settings(&ind->bd, 0x0001, NULL);
     }
     else if (conn && (ind->st != HCI_SUCC))
     {
@@ -1150,17 +1182,16 @@ static void bt_cm_hci_acl_disconnect_complete_event_hdl(BTS2S_DM_ACL_DISC_IND *i
 #endif
 
 #ifdef CFG_AV
-    /* Reset the AV request state only when the disconnected device owns
-     * an AV instance. An unconditional reset cancels the PENDING AV
-     * connect of an unrelated headset — e.g. a forgotten headset's page
-     * is rejected and its ACL torn down while the second headset is
-     * mid-connect — killing that attempt ("a2dp connect failed 97") and
-     * making the second headset connect unreliably. */
-    if (bt_av_get_idx_from_addr(bt_av_get_inst_data(), &ind->cur_bd) <
-            MAX_CONNS)
-    {
-        a2dp_reset_req();
-    }
+    /* Deliberately NO a2dp_reset_req() here: it is a GLOBAL reset of the
+     * shared AV request state, so any ACL drop (a rejected page, a
+     * headset powering off) cancels the PENDING AVDTP connect of an
+     * unrelated headset that is mid-connect — the "second headset never
+     * finishes connecting" killer. The application performs the stale-
+     * latch cleanup at the one safe moment instead: its connect timeout
+     * runs the reset only when no other connect is in flight
+     * (app_bt.c, APP_BT_CMD_CONNECT_TIMEOUT real branch). Pending
+     * requests on a dropped link already fail on their own ("a2dp
+     * connect failed 97") and clear their latch. */
 #endif
 
 #ifdef CFG_AVRCP
@@ -1218,7 +1249,18 @@ int bt_cm_hci_event_handler(uint16_t event_id, uint8_t *msg)
     case DM_EN_ACL_OPENED_IND:
     {
         BTS2S_DM_EN_ACL_OPENED_IND *ind = (BTS2S_DM_EN_ACL_OPENED_IND *)msg;
-        LOG_I("link connected COD:%d Incoming:%d hdl %d res %d\r\n", ind->dev_cls, ind->incoming, ind->phdl, ind->st);
+        /* This ind is sent on conn FAIL as well as succ (see the struct
+         * comment): don't print "link connected" for a failed page -- a
+         * powered-off headset's reconnect attempt used to fake a second
+         * connected headset in the log (hdl 65535, res != 0). */
+        if (ind->st == HCI_SUCC)
+        {
+            LOG_I("link connected COD:%d Incoming:%d hdl %d res %d\r\n", ind->dev_cls, ind->incoming, ind->phdl, ind->st);
+        }
+        else
+        {
+            LOG_I("link connect failed COD:%d Incoming:%d hdl %d res %d\r\n", ind->dev_cls, ind->incoming, ind->phdl, ind->st);
+        }
         LOG_I("bd addr %x-%x-%x\r\n", ind->bd.nap, ind->bd.uap, ind->bd.lap);
         bt_cm_hci_acl_connect_complete_event_hdl(ind);
         break;

@@ -8,6 +8,7 @@
 #include "bf0_ble_common.h"
 #include "bf0_ble_err.h"
 #include "bf0_sibles.h"
+#include "bt_connection_manager.h"
 
 #define LOG_TAG         "btapp_ge"
 #include "log.h"
@@ -200,6 +201,17 @@ __WEAK void bt_sc_io_capability_rsp(BTS2S_BD_ADDR *bd)
 __WEAK uint8_t bt_is_auto_request_connect(void)
 {
     return 1; // 0:it doesn't need check
+}
+
+/* Link role used when ACCEPTING an incoming ACL connection
+ * (HCI Accept_Connection_Request role parameter):
+ * BT_LINK_MASTER(0) = become master (role switch at accept),
+ * BT_LINK_SLAVE(1)  = stay slave. Default keeps the historical
+ * stay-slave behaviour; override in the application to make the
+ * relay the piconet master so incoming headsets join its piconet. */
+__WEAK uint8_t bt_get_acpt_link_role(void)
+{
+    return BT_LINK_SLAVE;
 }
 
 __WEAK uint8_t bt_open_bt_request(void)

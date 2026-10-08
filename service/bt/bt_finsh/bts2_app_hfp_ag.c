@@ -47,6 +47,63 @@ __WEAK uint32_t bt_hfp_ag_local_feature()
     return HFP_AG_LOCAL_FEATURES;
 }
 
+/****************************************remote SLC collision guard***************************************/
+/* The headset often opens the HFP session ITSELF a few seconds after
+ * AVDTP (measured ~3s on Anyka OWS T700). Firing our AG->HF connect into
+ * that in-flight setup collides inside RFCOMM and BOTH attempts die
+ * (CONN_CFM res 19) — the link then stays music-only until something
+ * gives the SLC another clean window. When a remote-initiated SLC
+ * (BTS2MU_AG_CONN_IND) is pending for a device, bt_hfp_ag_connect_request
+ * refuses to fire and lets the remote's own SLC finish instead. */
+#define BT_HFP_AG_INCOMING_SLC_WINDOW_MS 10000U
+
+static BTS2S_BD_ADDR g_hfp_ag_incoming_bd;
+static uint32_t g_hfp_ag_incoming_tick;
+static uint8_t g_hfp_ag_incoming_slc;
+
+static uint8_t bt_hfp_ag_bd_equal(BTS2S_BD_ADDR *a, BTS2S_BD_ADDR *b)
+{
+    return (a->lap == b->lap) && (a->uap == b->uap) && (a->nap == b->nap);
+}
+
+static void bt_hfp_ag_incoming_slc_start(BTS2S_BD_ADDR *bd)
+{
+    bd_copy(&g_hfp_ag_incoming_bd, bd);
+    g_hfp_ag_incoming_tick = rt_tick_get();
+    g_hfp_ag_incoming_slc = 1;
+}
+
+static void bt_hfp_ag_incoming_slc_clear(BTS2S_BD_ADDR *bd)
+{
+    if (g_hfp_ag_incoming_slc &&
+            ((bd == NULL) || bt_hfp_ag_bd_equal(&g_hfp_ag_incoming_bd, bd)))
+    {
+        g_hfp_ag_incoming_slc = 0;
+    }
+}
+
+static uint8_t bt_hfp_ag_incoming_slc_pending(BTS2S_BD_ADDR *bd)
+{
+    if (!g_hfp_ag_incoming_slc)
+    {
+        return 0;
+    }
+    if (!bt_hfp_ag_bd_equal(&g_hfp_ag_incoming_bd, bd))
+    {
+        return 0;
+    }
+    if ((rt_tick_get() - g_hfp_ag_incoming_tick) >=
+            rt_tick_from_millisecond(BT_HFP_AG_INCOMING_SLC_WINDOW_MS))
+    {
+        /* The remote's setup never resolved — stop holding our own
+         * connect back. */
+        g_hfp_ag_incoming_slc = 0;
+        return 0;
+    }
+    return 1;
+}
+/*******************************************************************************************************/
+
 /*******************************************device info func start**********************************************/
 static void bt_hfp_ag_app_init_device_info(bts2_hfp_ag_inst_data *ag_data)
 {
@@ -304,6 +361,14 @@ static void bt_hfp_ag_app_device_state_changed(bts2_app_stru *bts2_app_data, BTS
 
     USER_TRACE("hfp_ag device state: %d res: %d type %d mux_id:%d", con_msg->device_state, con_msg->res, con_msg->type, con_msg->mux_id);
 
+    if ((con_msg->device_state == HFP_DEVICE_CONNECTED) ||
+            (con_msg->device_state == HFP_DEVICE_DISCONNECTED))
+    {
+        /* Whatever direction opened the session, it has now resolved —
+         * our own outbound connect is free to fire again. */
+        bt_hfp_ag_incoming_slc_clear(&con_msg->bd);
+    }
+
     switch (p_data->st)
     {
     case HFP_AG_APP_INIT:
@@ -370,6 +435,21 @@ static void bt_hfp_ag_app_device_state_changed(bts2_app_stru *bts2_app_data, BTS
             BTS2S_HF_AUDIO_INFO msg;
             hfp_ag_audio_opt(&msg, 0);
 #endif // AUDIO_USING_MANAGER
+        }
+        else if (con_msg->res != HFP_AG_SUCC)
+        {
+            /* A connect attempt resolved with an error (e.g. res 19 when
+             * our AG->HF request collides with the remote's own in-flight
+             * SLC). Only CONNECTED/DISCONNECTED were reported before, so
+             * the app sat blind until its next blind retry. Report the
+             * failure as a CONNECTED event carrying the error so the app
+             * can back off briefly and retry into a clean window. */
+            bt_notify_profile_state_info_t profile_state;
+            bt_addr_convert(&con_msg->bd, profile_state.mac.addr);
+            profile_state.profile_type = BT_NOTIFY_HFP_AG;
+            profile_state.res = con_msg->res;
+            profile_state.profile_channel = con_msg->mux_id;
+            bt_profile_update_connection_state(BT_NOTIFY_HFP_AG, BT_NOTIFY_AG_PROFILE_CONNECTED, &profile_state);
         }
 
         break;
@@ -682,6 +762,11 @@ void bt_hfp_ag_msg_hdl(bts2_app_stru *bts2_app_data)
     {
         BTS2S_AG_CONN_REQ *con_msg;
         con_msg = (BTS2S_AG_CONN_REQ *)bts2_app_data->recv_msg;
+        /* Remote is opening the SLC itself right now — remember it so our
+         * own AG->HF connect does not fire into this in-flight setup
+         * (both attempts then die with res 19). Cleared when the session
+         * resolves in bt_hfp_ag_app_device_state_changed(). */
+        bt_hfp_ag_incoming_slc_start(&con_msg->bd);
         hfp_ag_connect_ind_res(&con_msg->bd, con_msg->rfcomm_chnl, 1);//acpt connect from remote
         // hfp_ag_connect_ind_res(&con_msg->bd, con_msg->rfcomm_chnl, 0);//reject connect from remote
         break;
@@ -945,6 +1030,15 @@ void bt_hfp_stop_profile_service(bts2_app_stru *bts2_app_data)
 
 int bt_hfp_ag_connect_request(BTS2S_BD_ADDR *bd)
 {
+    if (bt_hfp_ag_incoming_slc_pending(bd))
+    {
+        /* The remote is opening the SLC itself — do NOT fire our AG->HF
+         * connect into that in-flight setup; both attempts collide inside
+         * RFCOMM and both die (res 19). Let the remote's own SLC finish;
+         * if it fails, the failure notify frees the app to retry. */
+        USER_TRACE(" -- hfp ag connect suppressed: remote SLC in progress\n");
+        return (int)BT_ERROR_IN_PROGRESS;
+    }
     hfp_ag_connect(bd, 0);
     return 0;
 }

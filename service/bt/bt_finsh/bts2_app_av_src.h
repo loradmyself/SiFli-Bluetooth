@@ -183,6 +183,10 @@ void bt_avsrc_set_start_flag(BOOL flag);
 
 BOOL bt_avsrc_get_start_flag(void);
 
+/* Media forwarding diagnostics (see bts2_app_av_src.c). */
+void bt_avsrc_note_qos(U16 shdl, U16 buff_st);
+BOOL bt_avsrc_get_media_stats(U8 idx, U32 *req, U32 *nomem, U32 *qos, U8 *buff);
+
 #ifdef CFG_AV_SHARING
 uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb);
 #endif
@@ -205,6 +209,8 @@ uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb);
 #define bt_avsrc_get_stream_conn(inst) (-1)
 #define bt_avsrc_set_start_flag(flag)
 #define bt_avsrc_get_start_flag() 0
+#define bt_avsrc_note_qos(shdl, buff_st)
+#define bt_avsrc_get_media_stats(idx, req, nomem, qos, buff) (0)
 
 #endif
 

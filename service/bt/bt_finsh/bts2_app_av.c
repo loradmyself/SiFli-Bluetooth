@@ -2221,6 +2221,20 @@ static void bt_av_hdl_conn_cfm(bts2_app_stru *bts2_app_data)
         INFO_TRACE(">> (d%d)discover the remote device's audio end point\n", i);
 
         av_discover_req(inst->con[i].conn_id, ASSIGN_TLABEL);
+
+        /* Tell the application NOW, not only when the media transport
+         * (MUT) arrives: the MUT ind is the sole CONNECTED source and it
+         * is not guaranteed to fire for every flow — when it is silent
+         * the app never registers the link (A2DP=0 in status) while the
+         * AV layer is already streaming. The app ignores duplicates. */
+        {
+            bt_notify_profile_state_info_t profile_state = {0};
+            bt_addr_convert(&msg->bd, profile_state.mac.addr);
+            profile_state.profile_type = BT_NOTIFY_A2DP;
+            profile_state.profile_role = inst->con[i].cfg;
+            profile_state.res = BTS2_SUCC;
+            bt_profile_update_connection_state(BT_NOTIFY_A2DP, BT_NOTIFY_A2DP_PROFILE_CONNECTED, &profile_state);
+        }
     }
     else
     {
@@ -2266,6 +2280,22 @@ static void bt_av_hdl_conn_ind(bts2_app_stru *bts2_app_data)
 #endif
 
         INFO_TRACE("(d%d)URC av conn,ind\n", i);
+
+        /* Register with the application at signaling-connect time. The
+         * MUT ind (media transport open) used to be the only CONNECTED
+         * notification and it never fired for some remote-opened flows:
+         * the app then sat with A2DP=0 while the AV layer streamed, and
+         * its own grace expiry fired a second AVDTP into the existing
+         * one (9b conflict) before the watchdog tore the link down.
+         * The app ignores duplicate CONNECTED reports. */
+        {
+            bt_notify_profile_state_info_t profile_state = {0};
+            bt_addr_convert(&msg->bd, profile_state.mac.addr);
+            profile_state.profile_type = BT_NOTIFY_A2DP;
+            profile_state.profile_role = inst->con[i].cfg;
+            profile_state.res = BTS2_SUCC;
+            bt_profile_update_connection_state(BT_NOTIFY_A2DP, BT_NOTIFY_A2DP_PROFILE_CONNECTED, &profile_state);
+        }
 
 #ifdef BSP_BQB_TEST
         switch (BQB_TEST_CASE)
@@ -2600,6 +2630,8 @@ void bt_av_msg_handler(bts2_app_stru *bts2_app_data)
     {
         BTS2S_AV_QOS_IND *msg;
         msg = (BTS2S_AV_QOS_IND *)bts2_app_data->recv_msg;
+        /* Media-path liveness per stream (see bt_avsrc_get_media_stats). */
+        bt_avsrc_note_qos(msg->shdl, msg->buff_st);
         break;
     }
     case BTS2MU_AV_STREAM_DATA_IND:
@@ -2820,6 +2852,16 @@ void bt_av_start_stream(uint8_t con_idx)
     if (inst->con[con_idx].st == avconned_open)
     {
         USER_TRACE(">> (%d)start the av stream\n", con_idx);
+        /* The prebuilt start path logs "before start stream should
+         * prohibit sniff mode!" but never does it — implement it here.
+         * Clear the SNIFF bit of the link policy (role-switch only) so
+         * the LM refuses every Sniff entry, then kick the link out of
+         * Sniff if it already slid in (a headset that reconnects and
+         * idles 5s sits in Sniff, and the stream then plays silent).
+         * Policy first, exit second: the kick cannot land back in
+         * Sniff afterwards. */
+        hcia_wr_lp_settings(&inst->con[con_idx].av_rmt_addr, 0x0001, NULL);
+        hcia_exit_sniff_mode(&inst->con[con_idx].av_rmt_addr, NULL);
         av_start_req(1, ASSIGN_TLABEL, &inst->con[con_idx].stream_hdl);
         inst->con[con_idx].suspend_pending = FALSE;
         inst->con[con_idx].start_pending = TRUE;
