@@ -214,6 +214,18 @@ __WEAK uint8_t bt_get_acpt_link_role(void)
     return BT_LINK_SLAVE;
 }
 
+/* Decide whether an incoming ACL page is ACCEPTED (1, default) or
+ * declined at HCI level (0). Called from the BT task at connect-request
+ * time, before Accept/Reject Connection_Request is sent. Returning 0
+ * lets an application convert a passive reconnect into its own outgoing
+ * connect; the override is then responsible for starting that connect
+ * (the connect-request notification is still delivered afterwards). */
+__WEAK uint8_t bt_should_accept_incoming_conn(BTS2S_BD_ADDR *bd)
+{
+    (void)bd;
+    return 1;
+}
+
 __WEAK uint8_t bt_open_bt_request(void)
 {
     gap_open_req();

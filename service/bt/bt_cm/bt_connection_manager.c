@@ -1081,17 +1081,29 @@ static void bt_cm_hci_connect_request_event_hdl(BTS2S_DM_ACL_OPEN_IND *ind)
             return;
         }
 
-        if (conn == NULL)
+        if (!bt_should_accept_incoming_conn(&ind->bd))
         {
-            conn = bt_cm_conn_alloc(env, &ind->bd, link_type);
+            /* Application declined the passive accept — it converts this
+             * page into its own outgoing connect. Reject so the remote
+             * stops paging, but still fall through to the notify below so
+             * the application can start that connect. */
+            LOG_I("declined incoming page; app converts to outgoing connect");
+            hcia_send_rej_conn_request(&ind->bd, HCI_ERR_REJ_BY_RMT_NO_RES);
+        }
+        else
+        {
             if (conn == NULL)
             {
-                hcia_send_rej_conn_request(&ind->bd, HCI_ERR_REJ_BY_RMT_NO_RES);
-                return;
+                conn = bt_cm_conn_alloc(env, &ind->bd, link_type);
+                if (conn == NULL)
+                {
+                    hcia_send_rej_conn_request(&ind->bd, HCI_ERR_REJ_BY_RMT_NO_RES);
+                    return;
+                }
             }
-        }
 
-        hcia_send_acpt_conn_request(&ind->bd, bt_get_acpt_link_role());
+            hcia_send_acpt_conn_request(&ind->bd, bt_get_acpt_link_role());
+        }
     }
 
     bt_notify_device_conn_request_t conn_request;

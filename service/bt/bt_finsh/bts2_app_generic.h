@@ -171,6 +171,7 @@ uint32_t bt_get_class_of_device(void);
 
 uint8_t bt_is_auto_request_connect(void);
 uint8_t bt_get_acpt_link_role(void);
+uint8_t bt_should_accept_incoming_conn(BTS2S_BD_ADDR *bd);
 uint8_t bt_open_bt_request(void);
 uint8_t bt_close_bt_request(void);
 void bt_sc_io_capability_rsp(BTS2S_BD_ADDR *bd);
