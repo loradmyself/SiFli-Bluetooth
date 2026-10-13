@@ -54,8 +54,17 @@ __WEAK uint32_t bt_hfp_ag_local_feature()
  * (CONN_CFM res 19) — the link then stays music-only until something
  * gives the SLC another clean window. When a remote-initiated SLC
  * (BTS2MU_AG_CONN_IND) is pending for a device, bt_hfp_ag_connect_request
- * refuses to fire and lets the remote's own SLC finish instead. */
-#define BT_HFP_AG_INCOMING_SLC_WINDOW_MS 10000U
+ * refuses to fire and lets the remote's own SLC finish instead.
+ *
+ * The window only needs to cover a WORKING remote SLC (RFCOMM open ->
+ * SLC resolve is ~2s), but it must expire well before the 10s link
+ * supervision timeout: some headsets open the RFCOMM DLC and then never
+ * speak AT at all (Redmi Buds 4 Pro stalls exactly there), and the old
+ * 10s window outlived the link itself — our AG connect was suppressed
+ * every time and the headset died music-only. When the window expires
+ * with the SLC still unresolved, bt_hfp_ag_connect_request tears the
+ * dead session down so its retry starts a fresh one. */
+#define BT_HFP_AG_INCOMING_SLC_WINDOW_MS 4000U
 
 static BTS2S_BD_ADDR g_hfp_ag_incoming_bd;
 static uint32_t g_hfp_ag_incoming_tick;
@@ -84,23 +93,7 @@ static void bt_hfp_ag_incoming_slc_clear(BTS2S_BD_ADDR *bd)
 
 static uint8_t bt_hfp_ag_incoming_slc_pending(BTS2S_BD_ADDR *bd)
 {
-    if (!g_hfp_ag_incoming_slc)
-    {
-        return 0;
-    }
-    if (!bt_hfp_ag_bd_equal(&g_hfp_ag_incoming_bd, bd))
-    {
-        return 0;
-    }
-    if ((rt_tick_get() - g_hfp_ag_incoming_tick) >=
-            rt_tick_from_millisecond(BT_HFP_AG_INCOMING_SLC_WINDOW_MS))
-    {
-        /* The remote's setup never resolved — stop holding our own
-         * connect back. */
-        g_hfp_ag_incoming_slc = 0;
-        return 0;
-    }
-    return 1;
+    return g_hfp_ag_incoming_slc && bt_hfp_ag_bd_equal(&g_hfp_ag_incoming_bd, bd);
 }
 /*******************************************************************************************************/
 
@@ -1032,12 +1025,25 @@ int bt_hfp_ag_connect_request(BTS2S_BD_ADDR *bd)
 {
     if (bt_hfp_ag_incoming_slc_pending(bd))
     {
-        /* The remote is opening the SLC itself — do NOT fire our AG->HF
-         * connect into that in-flight setup; both attempts collide inside
-         * RFCOMM and both die (res 19). Let the remote's own SLC finish;
-         * if it fails, the failure notify frees the app to retry. */
-        USER_TRACE(" -- hfp ag connect suppressed: remote SLC in progress\n");
-        return (int)BT_ERROR_IN_PROGRESS;
+        if ((rt_tick_get() - g_hfp_ag_incoming_tick) <
+                rt_tick_from_millisecond(BT_HFP_AG_INCOMING_SLC_WINDOW_MS))
+        {
+            /* The remote is opening the SLC itself — do NOT fire our AG->HF
+             * connect into that in-flight setup; both attempts collide inside
+             * RFCOMM and both die (res 19). Let the remote's own SLC finish;
+             * if it fails, the failure notify frees the app to retry. */
+            USER_TRACE(" -- hfp ag connect suppressed: remote SLC in progress\n");
+            return (int)BT_ERROR_IN_PROGRESS;
+        }
+        /* Window expired with the remote's SLC never resolving (it opened
+         * the RFCOMM DLC and then never spoke AT — Redmi Buds stalls exactly
+         * there). The half-open session is a dead end: tear it down so the
+         * caller's retry starts a fresh SLC instead of colliding with the
+         * zombie DLC (CONN_CFM res 19). */
+        g_hfp_ag_incoming_slc = 0;
+        USER_TRACE(" -- hfp ag stalled remote SLC torn down; retry shortly\n");
+        hfp_ag_disconnect(bd);
+        return (int)BT_ERROR_TIMEOUT;
     }
     hfp_ag_connect(bd, 0);
     return 0;

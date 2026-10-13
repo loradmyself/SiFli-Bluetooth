@@ -2880,6 +2880,45 @@ void bt_av_start_stream(uint8_t con_idx)
     }
 }
 
+/* Drive the stream-setup chain (discover -> set cfg -> open) on a signaling
+ * connection whose remote opened AVDTP but never followed through with the
+ * set-config (some headsets stall right after the signaling connect). The
+ * outgoing path runs this chain automatically from bt_av_hdl_conn_cfm; the
+ * incoming path parks at avconned waiting for the remote forever. No-op when
+ * the stream is already configured/open/streaming or the device has no AV
+ * connection. Returns 0 when a discover was queued, 1 when there was nothing
+ * to do, <0 when the device is not connected. */
+int bt_av_drive_stream_setup(BTS2S_BD_ADDR *bd)
+{
+    bts2s_av_inst_data *inst = bt_av_get_inst_data();
+    U8 con_idx;
+
+    if ((inst == NULL) || (bd == NULL))
+    {
+        return -1;
+    }
+
+    con_idx = bt_av_get_idx_from_addr(inst, bd);
+    if (con_idx > MAX_CONNS)
+    {
+        return -1;
+    }
+
+    if (inst->con[con_idx].in_use && (inst->con[con_idx].st == avconned) &&
+            (inst->con[con_idx].role == ACPTOR))
+    {
+        /* Incoming only: the outgoing path already chains discover from
+         * bt_av_hdl_conn_cfm — re-driving it would double-send discover
+         * into a live chain. */
+        USER_TRACE(">> (%d)drive stalled stream setup: discover remote SEP\n", con_idx);
+        av_discover_req(inst->con[con_idx].conn_id, ASSIGN_TLABEL);
+        return 0;
+    }
+
+    /* already opening/open/streaming (or torn down) — nothing to drive */
+    return 1;
+}
+
 #ifdef AUDIO_USING_MANAGER
 void bt_av_start_stream_by_audio_server(uint8_t con_idx)
 {

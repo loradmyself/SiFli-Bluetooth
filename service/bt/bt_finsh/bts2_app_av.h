@@ -375,6 +375,7 @@ extern void bt_av_disconnect(uint8_t con_idx);
 extern void bt_av_suspend_stream(uint8_t con_idx);
 extern void bt_av_open_stream(void);
 extern void bt_av_start_stream(uint8_t con_idx);
+extern int bt_av_drive_stream_setup(BTS2S_BD_ADDR *bd);
 extern void bt_av_release_stream(uint8_t con_idx);
 extern void bt_av_abort_stream(uint8_t con_idx);
 extern void bt_av_get_cfg(uint8_t con_idx);
@@ -402,6 +403,7 @@ U8 bt_av_get_src_connected_number(void);
 #define bt_av_suspend_stream(con_idx)
 #define bt_av_open_stream()
 #define bt_av_start_stream(con_idx)
+#define bt_av_drive_stream_setup(bd) 0
 #define bt_av_release_stream(con_idx)
 #define bt_av_abort_stream(con_idx)
 #define bt_av_get_cfg(con_idx)
