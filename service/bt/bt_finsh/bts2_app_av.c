@@ -12,6 +12,10 @@
     #include "bt_rt_device.h"
 #endif
 
+#ifdef BSP_BT_CONNECTION_MANAGER
+    #include "bt_connection_manager.h"
+#endif
+
 #ifdef AUDIO_USING_MANAGER
     #include "audio_server.h"
 #endif // AUDIO_USING_MANAGER
@@ -2224,7 +2228,7 @@ static void bt_av_hdl_conn_cfm(bts2_app_stru *bts2_app_data)
 
         /* Tell the application NOW, not only when the media transport
          * (MUT) arrives: the MUT ind is the sole CONNECTED source and it
-         * is not guaranteed to fire for every flow — when it is silent
+         * is not guaranteed to fire for every flow 鈥?when it is silent
          * the app never registers the link (A2DP=0 in status) while the
          * AV layer is already streaming. The app ignores duplicates. */
         {
@@ -2268,14 +2272,21 @@ static void bt_av_hdl_conn_ind(bts2_app_stru *bts2_app_data)
         inst->con[i].idx = i;
         inst->con[i].st = avconned;
         bd_copy(&inst->con[i].av_rmt_addr, &msg->bd);
-#ifdef CFG_AV_SRC
-        /* Remote-opened AVDTP used to leave cfg at its init value
-         * (AV_AUDIO_NO_ROLE): the start confirmation then matched neither
-         * role, so the state never advanced to avconned_streaming and the
-         * sharing fan-out (st == avconned_streaming) sent zero packets —
-         * "connected with name but no sound" for every remote-opened
-         * link. We are the A2DP Source regardless of who opened the
-         * signaling channel. */
+#ifdef BSP_BT_CONNECTION_MANAGER
+        {
+            bt_cm_device_manager_t *cm_env = bt_cm_get_env();
+            bt_cm_dev_acl_info_t *cm_conn =
+                (cm_env != NULL) ? bt_cm_get_conn_by_addr(cm_env, &msg->bd) : NULL;
+
+            /* An incoming AVDTP connection does not carry its local role.
+             * A phone/computer link is the local A2DP Sink; a headset link
+             * remains the local A2DP Source. */
+            inst->con[i].cfg =
+                ((cm_conn != NULL) &&
+                 (cm_conn->info.link_type == BT_LINK_PHONE)) ?
+                AV_AUDIO_SNK : AV_AUDIO_SRC;
+        }
+#else
         inst->con[i].cfg = AV_AUDIO_SRC;
 #endif
 
@@ -2853,7 +2864,7 @@ void bt_av_start_stream(uint8_t con_idx)
     {
         USER_TRACE(">> (%d)start the av stream\n", con_idx);
         /* The prebuilt start path logs "before start stream should
-         * prohibit sniff mode!" but never does it — implement it here.
+         * prohibit sniff mode!" but never does it 鈥?implement it here.
          * Clear the SNIFF bit of the link policy (role-switch only) so
          * the LM refuses every Sniff entry, then kick the link out of
          * Sniff if it already slid in (a headset that reconnects and
@@ -2908,14 +2919,14 @@ int bt_av_drive_stream_setup(BTS2S_BD_ADDR *bd)
             (inst->con[con_idx].role == ACPTOR))
     {
         /* Incoming only: the outgoing path already chains discover from
-         * bt_av_hdl_conn_cfm — re-driving it would double-send discover
+         * bt_av_hdl_conn_cfm 鈥?re-driving it would double-send discover
          * into a live chain. */
         USER_TRACE(">> (%d)drive stalled stream setup: discover remote SEP\n", con_idx);
         av_discover_req(inst->con[con_idx].conn_id, ASSIGN_TLABEL);
         return 0;
     }
 
-    /* already opening/open/streaming (or torn down) — nothing to drive */
+    /* already opening/open/streaming (or torn down) 鈥?nothing to drive */
     return 1;
 }
 
@@ -3142,8 +3153,3 @@ U8 bt_av_get_src_connected_number(void)
 
 
 #endif // defined(CFG_AV_SNK) || defined(CFG_AV_SRC)
-
-
-
-
-
