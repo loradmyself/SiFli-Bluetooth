@@ -21,11 +21,11 @@ menu "Bluetooth Hardware Config"
             bool "BT classical enable"
             default y
             config MAX_BT_ACL
-                int "Supported ACL number. Maximum is 2"
+                int "Supported ACL number. Maximum is 3"
                 depends on STACK_BT_ON
                 default 2
             config MAX_BT_SCO
-                int "Supported SCO number. Maximum is 1"
+                int "Supported SCO number. Maximum is 2"
                 depends on STACK_BT_ON
                 default 1
         menuconfig STACK_BLE_ON

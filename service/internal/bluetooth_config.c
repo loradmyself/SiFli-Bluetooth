@@ -2334,10 +2334,10 @@ __ROM_USED tl_port_t rom_port_get(uint8_t idx)
     #define MAX_EM_BUFFER (24*1024)
 #endif
 #ifndef MAX_BT_ACL
-    #define MAX_BT_ACL 2
+    #define MAX_BT_ACL 3
 #endif
 #ifndef MAX_BT_SCO
-    #define MAX_BT_SCO 1
+    #define MAX_BT_SCO 2
 #endif
 #ifndef MAX_BLE_ACT
     #define MAX_BLE_ACT 6
