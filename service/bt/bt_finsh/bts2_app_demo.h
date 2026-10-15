@@ -59,7 +59,7 @@ extern "C" {
 #define MAX_ENB_TIME                (0)
 #define KEYB_CHK_TIMEOUT            (200*MILLISECOND)
 
-#define MAX_DISCOV_RESS             (10)
+#define MAX_DISCOV_RESS             (20)
 
 #define MAX_ONLY_FILE_NAME_LEN      (260)
 

@@ -510,6 +510,33 @@ BOOL bt_avsrc_get_media_stats(U8 idx, U32 *req, U32 *nomem, U32 *qos, U8 *buff)
     }
     return TRUE;
 }
+
+/* Serializes the shared SBC encoder state (bts2_sbc_encode/cfg/completed).
+ * The encoder library keeps global state and is not reentrant: the media
+ * producer thread encodes while the BT task may reconfigure the encoder
+ * when a stream opens or closes. A mutex instead of rt_enter_critical keeps
+ * the scheduler live during multi-millisecond encode bursts so the I2S RX
+ * thread can still drain the driver's record pipe (a scheduler lock there
+ * let the pipe overflow and spliced dropped PCM into the SBC stream). */
+static struct rt_mutex g_sbc_lock;
+static uint8_t g_sbc_lock_ready = 0;
+
+void bt_avsrc_sbc_lock(void)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    if (!g_sbc_lock_ready)
+    {
+        rt_mutex_init(&g_sbc_lock, "avsbcl", RT_IPC_FLAG_PRIO);
+        g_sbc_lock_ready = 1;
+    }
+    rt_hw_interrupt_enable(level);
+    rt_mutex_take(&g_sbc_lock, RT_WAITING_FOREVER);
+}
+
+void bt_avsrc_sbc_unlock(void)
+{
+    rt_mutex_release(&g_sbc_lock);
+}
 /*----------------------------------------------------------------------------*
  *
  * DESCRIPTION:
@@ -645,12 +672,14 @@ U8 bt_avsrc_prepare_sbc(bts2s_av_inst_data *inst, U8 con_idx)
     }
 #endif
 
+    bt_avsrc_sbc_lock();
     cfg->frmsize = bts2_sbc_encode_cfg(cfg->chnl_mode,
                                        cfg->alloc_method,
                                        cfg->sample_freq,
                                        cfg->blocks,
                                        cfg->subbands,
                                        cfg->bit_pool);
+    bt_avsrc_sbc_unlock();
 
     LOG_D("frmsize = %d\n", cfg->frmsize);
 
@@ -741,7 +770,9 @@ void bt_avsrc_hdl_disc_handler(bts2s_av_inst_data *inst, uint8_t con_idx)
 
     bt_avsrc_set_start_flag(FALSE);
 
+    bt_avsrc_sbc_lock();
     bts2_sbc_encode_completed();
+    bt_avsrc_sbc_unlock();
 }
 
 
@@ -1257,6 +1288,7 @@ static uint16_t bt_avsrc_send_data(struct rt_ringbuffer32 *rb)
             pcm_pkg_pos = AV_FIXED_MEDIA_PKT_HDR_SIZE + 1;
             pl = payload_size;
 
+            bt_avsrc_sbc_lock();
             while (numrd > 0)
             {
                 BTS2S_SBC_STREAM bss;
@@ -1279,6 +1311,7 @@ static uint16_t bt_avsrc_send_data(struct rt_ringbuffer32 *rb)
                 pl -= bss.dst_len_used;
                 frms += bss.dst_len_used / act_cfg->frmsize;
             }
+            bt_avsrc_sbc_unlock();
 
             bfree(ptr);
             payload_len = (U16)(frms * act_cfg->frmsize + 1 + AV_FIXED_MEDIA_PKT_HDR_SIZE);
@@ -1417,7 +1450,15 @@ uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb)
             // Just return if length is not enough
             if (len < act_cfg->frmsize * act_cfg->frms_per_payload + 13 + 2)
             {
-                LOG_I("a2dp_transfor: buffer empty\n");
+                static U32 s_empty_log_cnt = 0;
+
+                /* Log every 16th occurrence only: printing on every empty
+                 * poll floods the console while the BT task is busy and
+                 * makes the starvation worse. */
+                if ((s_empty_log_cnt++ & 0x0FU) == 0U)
+                {
+                    LOG_I("a2dp_transfor: buffer empty\n");
+                }
 
                 is_empty = 1;
                 send_timer_added = 1;
@@ -1426,24 +1467,34 @@ uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb)
                 {
                     inst->src_data.m_sec_time_4_next_pkt = inst->src_data.m_sec_per_pkt;
                 }
+                /* A negative delay converts to a huge U32 and stalls the
+                 * send timer; retry in 1 ms while the ring is refilled. */
+                if (inst->src_data.m_sec_time_4_next_pkt <= 0)
+                {
+                    inst->src_data.m_sec_time_4_next_pkt = 1;
+                }
                 inst->src_data.tid = bts2_timer_ev_add(inst->src_data.m_sec_time_4_next_pkt, bt_avsrc_sharing_cb, 0, (void *)rb);
                 return 0;
             }
 
             if (!is_empty)
             {
+                /* Static staging buffer: a bmalloc failure here used to
+                 * silently drop one whole media packet from every sink.
+                 * The BT task is the only reader of the share ring (send
+                 * timer and kick both run in the BT task), so no lock is
+                 * needed for this buffer. */
+                static U8 s_share_pkt_buf[1024];
+
                 rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, (U8 *)&pkt_len, sizeof(pkt_len));
 
-                pkt_ptr = bmalloc(pkt_len);
-
-                if (!pkt_ptr)
+                if ((pkt_len == 0U) || (pkt_len > sizeof(s_share_pkt_buf)))
                 {
-                    LOG_D("malloc error!!!!\n");
-                    if (inst->src_data.discard_data)
-                        rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, inst->src_data.discard_data, pkt_len);
+                    LOG_D("bad pkt_len %d\n", pkt_len);
                     break;
                 }
 
+                pkt_ptr = s_share_pkt_buf;
                 rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, pkt_ptr, pkt_len);
             }
 
@@ -1495,7 +1546,7 @@ uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb)
                         }
                     }
                 }
-                bfree(pkt_ptr);
+                /* pkt_ptr is the static staging buffer - nothing to free */
             }
         }
         while (0);
@@ -1517,7 +1568,10 @@ uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb)
             }
             else
             {
-                inst->src_data.tid = bts2_timer_ev_add(0, bt_avsrc_sharing_cb, 0, (void *)rb);
+                /* Catch up at 1 ms spacing instead of an immediate re-fire:
+                 * 0 ms double-sends show up as RTP cadence jitter at the
+                 * sink without actually getting the audio there faster. */
+                inst->src_data.tid = bts2_timer_ev_add(1, bt_avsrc_sharing_cb, 0, (void *)rb);
             }
         }
 #endif

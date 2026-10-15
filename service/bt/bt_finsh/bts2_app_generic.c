@@ -1423,29 +1423,22 @@ void bt_hdl_gap_msg(bts2_app_stru *bts2_app_data)
 
         if (bts2_app_data->inquiry_flag == TRUE)
         {
-            bts2_app_data->inquiry_list[bts2_app_data->inquiry_list_num] = msg->bd;
-            USER_TRACE("<< idx:%02d address:%04X:%02X:%06lX class:%06lX name:%s rssi:%d\n",
-                       bts2_app_data->inquiry_list_num,
-                       msg->bd.nap,
-                       msg->bd.uap,
-                       msg->bd.lap,
-                       msg->dev_cls,
-                       tmp,
-                       rssi);
-
-
-            //temp
-            //USER_TRACE(">>BTS2MU_GAP_DISCOV_RES_IND num%d \n",bts2_app_data->bd_list_num);
-
-            if (bts2_app_data->inquiry_list_num == MAX_DISCOV_RESS - 1)
+            /* Keep the first MAX_DISCOV_RESS results. The old counter
+             * wrapped back to 0 once the table was full, which both
+             * overwrote the oldest entries and made the completion dump
+             * print only the post-wrap remainder. */
+            if (bts2_app_data->inquiry_list_num < MAX_DISCOV_RESS)
             {
-                // gap_esc_discov_req(bts2_app_data->phdl);
-                // USER_TRACE(">> inquiry stop, since max res recvd...\n");
-                bts2_app_data->inquiry_list_num = 0;
-            }
-            else
-            {
-                bts2_app_data->inquiry_list_num++ ;
+                bts2_app_data->inquiry_list[bts2_app_data->inquiry_list_num] = msg->bd;
+                USER_TRACE("<< idx:%02d address:%04X:%02X:%06lX class:%06lX name:%s rssi:%d\n",
+                           bts2_app_data->inquiry_list_num,
+                           msg->bd.nap,
+                           msg->bd.uap,
+                           msg->bd.lap,
+                           msg->dev_cls,
+                           tmp,
+                           rssi);
+                bts2_app_data->inquiry_list_num++;
             }
         }
 

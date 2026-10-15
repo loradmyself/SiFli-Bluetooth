@@ -187,6 +187,10 @@ BOOL bt_avsrc_get_start_flag(void);
 void bt_avsrc_note_qos(U16 shdl, U16 buff_st);
 BOOL bt_avsrc_get_media_stats(U8 idx, U32 *req, U32 *nomem, U32 *qos, U8 *buff);
 
+/* Shared SBC encoder lock (see bts2_app_av_src.c). */
+void bt_avsrc_sbc_lock(void);
+void bt_avsrc_sbc_unlock(void);
+
 #ifdef CFG_AV_SHARING
 uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb);
 #endif
