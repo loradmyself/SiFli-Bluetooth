@@ -2363,10 +2363,10 @@ __ROM_USED tl_port_t rom_port_get(uint8_t idx)
 #endif // !SOC_SF32LB52X
 
 #define MAX_EXTRA_TX_BUF_CNT 2
-#if MAX_BT_ACL > 2
+#if MAX_BT_ACL > 3
     #error "BT ACL link exceed maximum number !"
 #endif
-#if MAX_BT_SCO > 1
+#if MAX_BT_SCO > 2
     #error "BT SCO link exceed maximum number !"
 #endif
 #if MAX_BLE_ACL > 10
