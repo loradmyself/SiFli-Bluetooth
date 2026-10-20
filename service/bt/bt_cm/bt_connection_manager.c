@@ -168,24 +168,34 @@ void bt_cm_add_bonded_dev(bt_cm_dev_info_t *dev, uint8_t force)
     }
     if (idx == BT_CM_MAX_BOND && force)
     {
-        idx = (g_bt_bonded_dev.last_bond_idx + 1) % BT_CM_MAX_BOND;
+        uint8_t start_idx = (g_bt_bonded_dev.last_bond_idx + 1) % BT_CM_MAX_BOND;
         bt_cm_device_manager_t *env = bt_cm_get_env();
         bt_cm_dev_acl_info_t *conn = NULL;
+
+        idx = start_idx;
         while (1)
         {
-            conn = bt_cm_get_conn_by_addr(env, &g_bt_bonded_dev.info[idx].bd_addr);
-            if (conn && conn->state == BT_CM_ACL_STATE_CONNECTED)
+            /* Never evict a phone bond to make room for a headset. The
+             * phone is the stable anchor for this relay; headset bonds are
+             * disposable/recreatable. */
+            if (g_bt_bonded_dev.info[idx].link_type != BT_LINK_PHONE)
             {
-                RT_ASSERT(idx != g_bt_bonded_dev.last_bond_idx);
-                idx++;
-                if (idx == BT_CM_MAX_BOND)
+                conn = bt_cm_get_conn_by_addr(env, &g_bt_bonded_dev.info[idx].bd_addr);
+                if ((conn == NULL) || (conn->state != BT_CM_ACL_STATE_CONNECTED))
                 {
-                    idx = 0;
+                    break;
                 }
             }
-            else
+
+            idx++;
+            if (idx == BT_CM_MAX_BOND)
             {
-                break;
+                idx = 0;
+            }
+            if (idx == start_idx)
+            {
+                /* Every slot is either a phone bond or an active link. */
+                return;
             }
         }
         sc_unpair_req(bts2_task_get_app_task_id(), &g_bt_bonded_dev.info[idx].bd_addr);
