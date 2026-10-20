@@ -193,6 +193,18 @@ void bt_avsrc_sbc_unlock(void);
 
 #ifdef CFG_AV_SHARING
 uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb);
+/* Media pacing on the dedicated "a2dptx" thread (see bts2_app_av_src.c):
+ * sched() arms the next pump iteration (delay 0/1 = asap) instead of the
+ * old bts2 send timer, cancel() stops pacing (audio close/pause/disconnect),
+ * armed() reports whether the send chain is alive so the app pump can
+ * re-kick it after a gate (suspend_pending etc.) dropped the chain. */
+void bt_avsrc_sharing_sched(struct rt_ringbuffer32 *rb, int32_t delay_ms);
+void bt_avsrc_sharing_cancel(void);
+int bt_avsrc_sharing_armed(void);
+#else
+#define bt_avsrc_sharing_sched(rb, delay_ms) do {} while (0)
+#define bt_avsrc_sharing_cancel() do {} while (0)
+#define bt_avsrc_sharing_armed() 0
 #endif
 
 #else

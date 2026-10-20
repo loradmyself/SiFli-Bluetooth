@@ -86,6 +86,7 @@ static int bt_avsrc_register_audio_close(void *user_data)
         inst->src_data.tid = 0;
         send_timer_added = 0;
     }
+    bt_avsrc_sharing_cancel();
     inst->src_data.input_cb = NULL;
     inst->src_data.audio_state = AVSRC_AUDIO_SER_IDLE;
     for (uint32_t i = 0; i < MAX_CONNS; i++)
@@ -114,6 +115,7 @@ static int bt_avsrc_register_audio_ioctl(void *user_data, int cmd, void *val)
             inst->src_data.tid = 0;
             send_timer_added = 0;
         }
+        bt_avsrc_sharing_cancel();
         inst->src_data.input_cb = NULL;
         inst->src_data.audio_state = AVSRC_AUDIO_SER_IDLE;
         for (uint32_t i = 0; i < MAX_CONNS; i++)
@@ -537,6 +539,162 @@ void bt_avsrc_sbc_unlock(void)
 {
     rt_mutex_release(&g_sbc_lock);
 }
+
+/* Serializes the media pump against the audio-manager send path: both do
+ * read-modify-write on inst->src_data pacing fields (m_sec_time_4_next_pkt
+ * and friends) and both call into bmalloc/av_stream_data_req. Same lazy
+ * rt_mutex pattern as g_sbc_lock; lock order is tx_lock -> sbc_lock only,
+ * so no inversion with bt_avsrc_send_data()'s encoder section. */
+static struct rt_mutex g_tx_lock;
+static uint8_t g_tx_lock_ready = 0;
+
+static void bt_avsrc_tx_lock(void)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    if (!g_tx_lock_ready)
+    {
+        rt_mutex_init(&g_tx_lock, "avtxl", RT_IPC_FLAG_PRIO);
+        g_tx_lock_ready = 1;
+    }
+    rt_hw_interrupt_enable(level);
+    rt_mutex_take(&g_tx_lock, RT_WAITING_FOREVER);
+}
+
+static void bt_avsrc_tx_unlock(void)
+{
+    rt_mutex_release(&g_tx_lock);
+}
+
+/* ---- Dedicated A2DP media TX thread ("a2dptx") --------------------------
+ * The send pump used to be a bts2 timer callback on the "bts" task.
+ * bts2_task_run drains all message queues before expired timers, so any
+ * signaling storm (HFP SLC while the second headset connects) starves the
+ * ~29 ms send timer for hundreds of ms and the forwarded audio stutters.
+ * av_stream_data_req itself is only bt_mem_alloc + bts2_msg_put (thread
+ * safe; its message path stayed alive throughout the observed 360 ms gap),
+ * so pacing now runs on a dedicated RT-Thread above the BT task and the
+ * prebuilt stack needs no change. "a2dptx" is the only caller of
+ * bt_avsrc_sharing() and therefore the only reader of the share ring; the
+ * app kick arms this thread via bt_avsrc_sharing_sched() instead of
+ * calling bt_avsrc_sharing() itself. */
+#define BT_AVSRC_TX_EVT_SCHED   (1U << 0)
+#define BT_AVSRC_TX_EVT_STOP    (1U << 1)
+/* Catch-up step after a stall: bounded spacing keeps the RTP cadence even
+ * while still refilling the sink's jitter buffer quickly. */
+#define BT_AVSRC_TX_CATCHUP_MS  5
+#define BT_AVSRC_TX_STACK_SIZE  2048
+
+#ifdef CFG_AV_SHARING
+static struct rt_event s_avsrc_tx_evt;
+static volatile uint8_t s_tx_ready = 0;
+static volatile uint8_t s_tx_armed = 0;
+static volatile uint8_t s_tx_stop_req = 0;
+static volatile int32_t s_tx_delay_ms = 0;
+static struct rt_ringbuffer32 *s_tx_rb = NULL;
+
+int bt_avsrc_sharing_armed(void)
+{
+    return s_tx_armed ? 1 : 0;
+}
+
+void bt_avsrc_sharing_cancel(void)
+{
+    /* Sticky until the next explicit sched(): a fire already in flight
+     * must not rearm itself through the end-of-pump reschedule. */
+    s_tx_stop_req = 1;
+    s_tx_armed = 0;
+    if (s_tx_ready)
+        rt_event_send(&s_avsrc_tx_evt, BT_AVSRC_TX_EVT_STOP);
+}
+
+static struct rt_thread s_avsrc_tx_thread;
+ALIGN(4) static rt_uint8_t s_avsrc_tx_stack[BT_AVSRC_TX_STACK_SIZE];
+
+static void bt_avsrc_tx_arm(struct rt_ringbuffer32 *rb, int32_t delay_ms)
+{
+    if (delay_ms < 1)
+        delay_ms = 1;
+    s_tx_rb = rb;
+    s_tx_delay_ms = delay_ms;
+    s_tx_armed = 1;
+    rt_event_send(&s_avsrc_tx_evt, BT_AVSRC_TX_EVT_SCHED);
+}
+
+/* End-of-pump reschedule: honors a concurrent cancel. */
+static void bt_avsrc_sharing_rearm(struct rt_ringbuffer32 *rb, int32_t delay_ms)
+{
+    if (!s_tx_stop_req)
+        bt_avsrc_tx_arm(rb, delay_ms);
+}
+
+static void bt_avsrc_tx_thread(void *param)
+{
+    (void)param;
+
+    while (1)
+    {
+        rt_uint32_t recvd = 0;
+        rt_err_t err;
+        int32_t delay;
+
+        if (!s_tx_armed)
+        {
+            rt_event_recv(&s_avsrc_tx_evt,
+                          BT_AVSRC_TX_EVT_SCHED | BT_AVSRC_TX_EVT_STOP,
+                          RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
+                          RT_WAITING_FOREVER, &recvd);
+            if (recvd & BT_AVSRC_TX_EVT_STOP)
+                s_tx_armed = 0;
+            continue;
+        }
+
+        delay = s_tx_delay_ms;
+        err = rt_event_recv(&s_avsrc_tx_evt,
+                            BT_AVSRC_TX_EVT_SCHED | BT_AVSRC_TX_EVT_STOP,
+                            RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
+                            delay > 0 ? rt_tick_from_millisecond(delay) : 0,
+                            &recvd);
+        if (recvd & BT_AVSRC_TX_EVT_STOP)
+        {
+            s_tx_armed = 0;
+            continue;
+        }
+        if (err == RT_EOK)
+            continue;               /* re-armed: pick up the new delay */
+
+        /* Deadline reached: one pump iteration. s_tx_armed is cleared
+         * before the body so an early return (no conn / suspend gate)
+         * leaves the chain idle and the app pump can re-kick it. */
+        s_tx_armed = 0;
+        bt_avsrc_sharing(s_tx_rb);
+    }
+}
+
+static void bt_avsrc_tx_init_once(void)
+{
+    /* Interrupt-disable guard (not g_tx_lock): sched() may be called while
+     * the producer holds the SBC lock, and bt_avsrc_send_data() takes
+     * tx_lock -> sbc_lock, so init must never nest the other way. */
+    rt_base_t level = rt_hw_interrupt_disable();
+    if (!s_tx_ready)
+    {
+        rt_event_init(&s_avsrc_tx_evt, "avtxe", RT_IPC_FLAG_PRIO);
+        rt_thread_init(&s_avsrc_tx_thread, "a2dptx", bt_avsrc_tx_thread, RT_NULL,
+                       s_avsrc_tx_stack, sizeof(s_avsrc_tx_stack),
+                       RT_THREAD_PRIORITY_HIGH - 1, RT_THREAD_TICK_DEFAULT);
+        rt_thread_startup(&s_avsrc_tx_thread);
+        s_tx_ready = 1;
+    }
+    rt_hw_interrupt_enable(level);
+}
+
+void bt_avsrc_sharing_sched(struct rt_ringbuffer32 *rb, int32_t delay_ms)
+{
+    bt_avsrc_tx_init_once();
+    s_tx_stop_req = 0;
+    bt_avsrc_tx_arm(rb, delay_ms);
+}
+#endif /* CFG_AV_SHARING */
 /*----------------------------------------------------------------------------*
  *
  * DESCRIPTION:
@@ -765,6 +923,7 @@ void bt_avsrc_hdl_disc_handler(bts2s_av_inst_data *inst, uint8_t con_idx)
             inst->src_data.tid = 0;
             send_timer_added = 0;
         }
+        bt_avsrc_sharing_cancel();
     }
 #endif
 
@@ -1154,7 +1313,7 @@ static void bt_avsrc_send_data(U16 m, void *data)
 }
 #else
 
-static uint16_t bt_avsrc_send_data(struct rt_ringbuffer32 *rb)
+static uint16_t bt_avsrc_send_data_locked(struct rt_ringbuffer32 *rb)
 {
     bts2s_av_inst_data *inst = bt_av_get_inst_data();
 
@@ -1363,16 +1522,19 @@ static uint16_t bt_avsrc_send_data(struct rt_ringbuffer32 *rb)
     return bytes_rd;
 }
 
-
-#ifdef CFG_AV_SHARING
-static void bt_avsrc_sharing_cb(uint16_t m, void *para)
+static uint16_t bt_avsrc_send_data(struct rt_ringbuffer32 *rb)
 {
-    struct rt_ringbuffer32 *rb = (struct rt_ringbuffer32 *)para;
-    send_timer_added = 0;
-    bt_avsrc_sharing(rb);
+    uint16_t bytes_rd;
+
+    bt_avsrc_tx_lock();
+    bytes_rd = bt_avsrc_send_data_locked(rb);
+    bt_avsrc_tx_unlock();
+    return bytes_rd;
 }
 
-uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb)
+
+#ifdef CFG_AV_SHARING
+static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
 {
     bts2s_av_inst_data *inst = bt_av_get_inst_data();
 
@@ -1461,19 +1623,18 @@ uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb)
                 }
 
                 is_empty = 1;
-                send_timer_added = 1;
                 LOG_D("m_sec_time_4_next_pkt1 = %d\n", inst->src_data.m_sec_time_4_next_pkt);
                 if ((inst->src_data.m_sec_time_4_next_pkt < 0) && ((inst->src_data.m_sec_time_4_next_pkt + inst->src_data.m_sec_per_pkt * 20) < 0))
                 {
                     inst->src_data.m_sec_time_4_next_pkt = inst->src_data.m_sec_per_pkt;
                 }
-                /* A negative delay converts to a huge U32 and stalls the
-                 * send timer; retry in 1 ms while the ring is refilled. */
+                /* A negative delay used to convert to a huge U32 and stall
+                 * the send timer; retry in 1 ms while the ring is refilled. */
                 if (inst->src_data.m_sec_time_4_next_pkt <= 0)
                 {
                     inst->src_data.m_sec_time_4_next_pkt = 1;
                 }
-                inst->src_data.tid = bts2_timer_ev_add(inst->src_data.m_sec_time_4_next_pkt, bt_avsrc_sharing_cb, 0, (void *)rb);
+                bt_avsrc_sharing_rearm(rb, inst->src_data.m_sec_time_4_next_pkt);
                 return 0;
             }
 
@@ -1481,9 +1642,9 @@ uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb)
             {
                 /* Static staging buffer: a bmalloc failure here used to
                  * silently drop one whole media packet from every sink.
-                 * The BT task is the only reader of the share ring (send
-                 * timer and kick both run in the BT task), so no lock is
-                 * needed for this buffer. */
+                 * "a2dptx" is the only reader of the share ring (the app
+                 * kick arms the TX thread instead of touching the ring),
+                 * so no lock is needed for this buffer. */
                 static U8 s_share_pkt_buf[1024];
 
                 rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, (U8 *)&pkt_len, sizeof(pkt_len));
@@ -1551,32 +1712,40 @@ uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb)
         }
         while (0);
 
-#ifdef AUDIO_USING_MANAGER
-        // LOG_D("m_sec_time_4_next_pkt = %d\n", inst->src_data.m_sec_time_4_next_pkt);
+        /* Self-rearm on the "a2dptx" thread. Unconditional (was under
+         * AUDIO_USING_MANAGER): the sharing chain must keep pacing by
+         * itself now that the bts2 send timer is gone. */
         if (inst->src_data.m_sec_time_4_next_pkt > 0)
         {
-            send_timer_added = 1;
-            inst->src_data.tid = bts2_timer_ev_add(inst->src_data.m_sec_time_4_next_pkt, bt_avsrc_sharing_cb, 0, (void *)rb);
+            bt_avsrc_sharing_rearm(rb, inst->src_data.m_sec_time_4_next_pkt);
         }
         else
         {
-            send_timer_added = 1;
             if ((inst->src_data.m_sec_time_4_next_pkt < 0) && ((inst->src_data.m_sec_time_4_next_pkt + inst->src_data.m_sec_per_pkt * 20) < 0))
             {
                 inst->src_data.m_sec_time_4_next_pkt = inst->src_data.m_sec_per_pkt;
-                inst->src_data.tid = bts2_timer_ev_add(inst->src_data.m_sec_time_4_next_pkt, bt_avsrc_sharing_cb, 0, (void *)rb);
+                bt_avsrc_sharing_rearm(rb, inst->src_data.m_sec_per_pkt);
             }
             else
             {
-                /* Catch up at 1 ms spacing instead of an immediate re-fire:
-                 * 0 ms double-sends show up as RTP cadence jitter at the
+                /* Catch up at a bounded step instead of an immediate re-fire:
+                 * back-to-back sends show up as RTP cadence jitter at the
                  * sink without actually getting the audio there faster. */
-                inst->src_data.tid = bts2_timer_ev_add(1, bt_avsrc_sharing_cb, 0, (void *)rb);
+                bt_avsrc_sharing_rearm(rb, BT_AVSRC_TX_CATCHUP_MS);
             }
         }
-#endif
     }
 
+    return bytes_rd;
+}
+
+uint16_t bt_avsrc_sharing(struct rt_ringbuffer32 *rb)
+{
+    uint16_t bytes_rd;
+
+    bt_avsrc_tx_lock();
+    bytes_rd = bt_avsrc_sharing_locked(rb);
+    bt_avsrc_tx_unlock();
     return bytes_rd;
 }
 #endif
