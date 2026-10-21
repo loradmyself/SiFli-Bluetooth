@@ -565,6 +565,89 @@ static void bt_avsrc_tx_unlock(void)
     rt_mutex_release(&g_tx_lock);
 }
 
+/* ---- Media send buffer pool --------------------------------------------
+ * The per-sink fan-out used to bmalloc() one ~631 B copy per packet and
+ * silently drop the packet when the heap was busy (SDP/HFP allocations
+ * during the second-headset connect). The dropped record had already
+ * advanced inst->time_stamp while the per-stream RTP seq did not, so the
+ * sink saw an RTP ts jump and the decoder chain hiccupped (the "seq-556
+ * click" class).
+ *
+ * The stack takes ownership of each copy and returns it through
+ * bt_mem_free() (weak trampoline to rt_free; l2cm_datawr_free /
+ * avh_stream_data_req / av_stream_buff_clear all free via it), so a plain
+ * static pool would make rt_free() receive a static address and corrupt
+ * the heap. Instead the pool owns its blocks and only bt_mem_free() is
+ * redirected for pool addresses; every other free is byte-identical to the
+ * default trampoline. Allocation falls back to bt_mem_alloc() when the
+ * pool is empty so worst-case pressure degrades to the old behavior
+ * instead of failing hard. Free-list ops are O(1) under an interrupt
+ * disable (alloc from "a2dptx", free from the BT task). */
+static void *bt_avsrc_media_alloc(rt_size_t size);
+
+#ifndef BSP_USING_PC_SIMULATOR
+#define BT_AVSRC_MEM_POOL_BLKS   16
+#define BT_AVSRC_MEM_POOL_BYTES  704   /* >= 10 * 63 + 13 SBC media pkt */
+ALIGN(4) static uint8_t s_mem_pool[BT_AVSRC_MEM_POOL_BLKS][BT_AVSRC_MEM_POOL_BYTES];
+static uint8_t *s_mem_pool_free[BT_AVSRC_MEM_POOL_BLKS];
+static uint32_t s_mem_pool_cnt = 0;
+static uint8_t s_mem_pool_ready = 0;
+
+void bt_mem_free(void *ptr)
+{
+    uint8_t *p8 = (uint8_t *)ptr;
+    uint8_t *pool = &s_mem_pool[0][0];
+
+    if (p8 == NULL)
+        return;
+
+    /* Byte-wise bounds. s_mem_pool is uint8_t[BLKS][BYTES], so a bare
+     * s_mem_pool + sizeof(s_mem_pool) pointer add scales by BYTES and the
+     * upper bound lands ~704x too far — that version swallowed every heap
+     * free into the pool list (the heap sits inside the bogus range),
+     * leaked the heap full, and hcit_send_acl_data then NULL-derefed its
+     * bt_mem_alloc() result. Keep the end pointer byte-addressed. */
+    if ((p8 >= pool) && (p8 < pool + sizeof(s_mem_pool)))
+    {
+        rt_base_t level = rt_hw_interrupt_disable();
+        if (s_mem_pool_cnt < BT_AVSRC_MEM_POOL_BLKS)
+            s_mem_pool_free[s_mem_pool_cnt++] = p8;
+        rt_hw_interrupt_enable(level);
+        return;
+    }
+    rt_free(p8);
+}
+
+static void *bt_avsrc_media_alloc(rt_size_t size)
+{
+    void *p = NULL;
+
+    if (size <= BT_AVSRC_MEM_POOL_BYTES)
+    {
+        rt_base_t level = rt_hw_interrupt_disable();
+        if (!s_mem_pool_ready)
+        {
+            /* Blocks can only be handed out after this seed, so a
+             * bt_mem_free() of a pool address can never race it. */
+            for (uint32_t i = 0; i < BT_AVSRC_MEM_POOL_BLKS; i++)
+                s_mem_pool_free[s_mem_pool_cnt++] = s_mem_pool[i];
+            s_mem_pool_ready = 1;
+        }
+        if (s_mem_pool_cnt > 0)
+            p = s_mem_pool_free[--s_mem_pool_cnt];
+        rt_hw_interrupt_enable(level);
+        if (p != NULL)
+            return p;
+    }
+    return bmalloc(size);
+}
+#else /* BSP_USING_PC_SIMULATOR: no weak trampoline to override */
+static void *bt_avsrc_media_alloc(rt_size_t size)
+{
+    return bmalloc(size);
+}
+#endif /* BSP_USING_PC_SIMULATOR */
+
 /* ---- Dedicated A2DP media TX thread ("a2dptx") --------------------------
  * The send pump used to be a bts2 timer callback on the "bts" task.
  * bts2_task_run drains all message queues before expired timers, so any
@@ -583,6 +666,26 @@ static void bt_avsrc_tx_unlock(void)
  * while still refilling the sink's jitter buffer quickly. */
 #define BT_AVSRC_TX_CATCHUP_MS  5
 #define BT_AVSRC_TX_STACK_SIZE  2048
+/* Credit gate: av_get_stream_buffize() reports the per-stream media FIFO
+ * depth (avh_stream_data_req enqueues behind one in-flight L2CA write and
+ * every L2CAP data_cfm pops one). Depth >= 3 means >= 4 media packets are
+ * already inside the L2CA/HCI/controller pipeline — all four of the
+ * controller's ACL buffers' worth, the Frontline "credits: -4" window —
+ * so the next copy would only queue behind the connect signaling. Holding
+ * here keeps one ACL slot free for AVDTP/HFP signaling, which shortens
+ * the connect storm itself. Below the threshold the pump is released on
+ * the next poll. */
+#define BT_AVSRC_TX_CREDIT_HOLD 3
+/* Poll period while a record is held (credit gate / alloc retry): short
+ * enough that releasing is felt within one audio frame slice, long enough
+ * not to spin. */
+#define BT_AVSRC_TX_HOLD_MS     1
+/* Consecutive fan-out allocation failures tolerated before the pending
+ * record is dropped (WITHOUT advancing time_stamp) to keep the chain
+ * alive. 32 polls x 1 ms = 32 ms of retrying covers every transient heap
+ * squeeze seen in captures; beyond that a frozen stream would be worse
+ * than one lost frame. */
+#define BT_AVSRC_TX_FAILS_MAX   32
 
 #ifdef CFG_AV_SHARING
 static struct rt_event s_avsrc_tx_evt;
@@ -1482,7 +1585,7 @@ static uint16_t bt_avsrc_send_data_locked(struct rt_ringbuffer32 *rb)
                 {
                     if (inst->con[i].st == avconned_streaming && inst->con[i].cfg == AV_AUDIO_SRC)
                     {
-                        U8 *stream_data = bmalloc(payload_len);
+                        U8 *stream_data = bt_avsrc_media_alloc(payload_len);
                         if (stream_data)
                         {
                             memcpy(stream_data, pkt_ptr, payload_len);
@@ -1534,6 +1637,18 @@ static uint16_t bt_avsrc_send_data(struct rt_ringbuffer32 *rb)
 
 
 #ifdef CFG_AV_SHARING
+/* One-record peek/commit staging ("L1" ts 提交语义): a record read from the
+ * share ring is committed (inst->time_stamp advanced, staging released)
+ * only after every sink copy has been handed to av_stream_data_req. A
+ * fan-out allocation failure keeps the record staged and retries on the
+ * next poll instead of dropping audio with a ts gap. "a2dptx" is the only
+ * reader of the share ring (the app kick arms the TX thread instead of
+ * touching the ring), so no lock is needed for this state. */
+static U8 s_share_pkt_buf[1024];
+static U16 s_share_pkt_len = 0;
+static U8 s_share_pkt_pending = 0;
+static U8 s_share_pkt_fails = 0;
+
 static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
 {
     bts2s_av_inst_data *inst = bt_av_get_inst_data();
@@ -1546,7 +1661,6 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
     bts2_sbc_cfg *act_cfg  = NULL;
     U16 pkt_len;
 
-    uint8_t is_empty = 0;
     uint8_t is_update_us = 0;
 
     con_idx = bt_avsrc_get_stream_conn(inst);
@@ -1569,10 +1683,26 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
             U32 sb_pos = 0;
             U32 rd_len = 0;
             U16 pl;
-            // U16 buffer_count = av_get_stream_buffize();
 
+            /* L1 credit gate: hold the fan-out while the downstream media
+             * pipeline is already carrying >= 4 packets (FIFO depth >= 3
+             * plus the one in-flight L2CA write), i.e. all of the
+             * controller's ACL buffers. Leaving the last slot unused lets
+             * connect signaling through and shortens the air storm that is
+             * the root of the connect-window stutter. The gate runs before
+             * the pacing math so a hold is not counted as one media
+             * period; the FIFO draining below the threshold releases the
+             * pump on the next 1 ms poll. */
+            if (av_get_stream_buffize() >= BT_AVSRC_TX_CREDIT_HOLD)
+            {
+                bt_avsrc_sharing_rearm(rb, BT_AVSRC_TX_HOLD_MS);
+                return 0;
+            }
 
-            if (inst->src_data.stream_frm_time_begin != 0)
+            /* Pacing tracks committed packets only: a 1 ms retry poll must
+             * not be measured as a 29 ms period or the next delay stretches
+             * to ~57 ms and the cadence drifts. */
+            if ((inst->src_data.stream_frm_time_begin != 0) && !s_share_pkt_pending)
             {
                 inst->src_data.stream_frm_time_end = BTS2_GET_TIME();
 
@@ -1595,7 +1725,10 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
                 }
             }
 
-            inst->src_data.stream_frm_time_begin = BTS2_GET_TIME();
+            if (!s_share_pkt_pending)
+            {
+                inst->src_data.stream_frm_time_begin = BTS2_GET_TIME();
+            }
 
             // if ((buffer_count >= av_get_max_stream_buffer_cnt() / 2) && (bt_av_get_src_streaming_number() == 1))
             // {
@@ -1609,8 +1742,11 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
 
             // LOG_I("len = %d\n",len);
 
-            // Just return if length is not enough
-            if (len < act_cfg->frmsize * act_cfg->frms_per_payload + 13 + 2)
+            // Just return if length is not enough. A staged (uncommitted)
+            // record always has a payload to retry, so it never takes this
+            // path even when the ring itself is drained.
+            if (!s_share_pkt_pending &&
+                    (len < act_cfg->frmsize * act_cfg->frms_per_payload + 13 + 2))
             {
                 static U32 s_empty_log_cnt = 0;
 
@@ -1622,7 +1758,6 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
                     LOG_I("a2dp_transfor: buffer empty\n");
                 }
 
-                is_empty = 1;
                 LOG_D("m_sec_time_4_next_pkt1 = %d\n", inst->src_data.m_sec_time_4_next_pkt);
                 if ((inst->src_data.m_sec_time_4_next_pkt < 0) && ((inst->src_data.m_sec_time_4_next_pkt + inst->src_data.m_sec_per_pkt * 20) < 0))
                 {
@@ -1638,15 +1773,11 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
                 return 0;
             }
 
-            if (!is_empty)
+            if (!s_share_pkt_pending)
             {
-                /* Static staging buffer: a bmalloc failure here used to
-                 * silently drop one whole media packet from every sink.
-                 * "a2dptx" is the only reader of the share ring (the app
-                 * kick arms the TX thread instead of touching the ring),
-                 * so no lock is needed for this buffer. */
-                static U8 s_share_pkt_buf[1024];
-
+                /* Stage one record. It is only "committed" (time_stamp
+                 * advanced, staging released) after every sink copy is
+                 * handed to av_stream_data_req below. */
                 rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, (U8 *)&pkt_len, sizeof(pkt_len));
 
                 if ((pkt_len == 0U) || (pkt_len > sizeof(s_share_pkt_buf)))
@@ -1655,15 +1786,23 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
                     break;
                 }
 
-                pkt_ptr = s_share_pkt_buf;
-                rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, pkt_ptr, pkt_len);
+                rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, s_share_pkt_buf, pkt_len);
+                s_share_pkt_len = pkt_len;
+                s_share_pkt_pending = 1;
             }
+            pkt_ptr = s_share_pkt_buf;
+            pkt_len = s_share_pkt_len;
 
 
             // if (inst->con[con_idx].st == avconned_streaming)
             {
                 bts2_sbc_cfg *cfg = &inst->con[con_idx].act_cfg;
                 U8 nb_sbc_frm = pkt_ptr[12];
+                U32 send_ts;
+                U8 *copies[MAX_CONNS];
+                U8 copy_slot[MAX_CONNS];
+                U8 ncopy = 0;
+                U8 fanout_ok = 1;
 
                 if (nb_sbc_frm < cfg->frms_per_payload)
                 {
@@ -1682,32 +1821,73 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
                     }
                 }
 
-                inst->time_stamp += nb_sbc_frm * act_cfg->blocks * act_cfg->subbands;
+                send_ts = inst->time_stamp + nb_sbc_frm * act_cfg->blocks * act_cfg->subbands;
 
+                /* L1 发送缓冲池: allocate every sink copy before touching
+                 * any of them, so a single allocation failure costs nothing
+                 * and all sinks always see the same timestamps. */
                 for (U8 i = 0; i < MAX_CONNS; i++)
                 {
                     if (inst->con[i].st == avconned_streaming && inst->con[i].cfg == AV_AUDIO_SRC)
                     {
-                        U8 *stream_data = bmalloc(pkt_len);
-                        if (stream_data)
-                        {
-                            memcpy(stream_data, pkt_ptr, pkt_len);
-                            av_stream_data_req(inst->con[i].stream_hdl,
-                                               FALSE,
-                                               FALSE,
-                                               96, //any dynamic PT in the range 96 - 127
-                                               inst->time_stamp,
-                                               pkt_len,
-                                               stream_data); /**/
-                            s_media_req[i]++;
-                        }
-                        else
+                        U8 *stream_data = bt_avsrc_media_alloc(pkt_len);
+                        if (stream_data == NULL)
                         {
                             s_media_nomem[i]++;
+                            fanout_ok = 0;
+                            break;
                         }
+                        copies[ncopy] = stream_data;
+                        copy_slot[ncopy] = i;
+                        ncopy++;
                     }
                 }
-                /* pkt_ptr is the static staging buffer - nothing to free */
+
+                if (!fanout_ok)
+                {
+                    while (ncopy > 0)
+                    {
+                        bfree(copies[--ncopy]);
+                    }
+
+                    if (s_share_pkt_fails < BT_AVSRC_TX_FAILS_MAX)
+                    {
+                        /* L1 ts 提交语义: the record stays staged and
+                         * time_stamp is NOT advanced — the same packet is
+                         * retried on the next poll, so no RTP ts jump ever
+                         * reaches the sink. */
+                        s_share_pkt_fails++;
+                        bt_avsrc_sharing_rearm(rb, BT_AVSRC_TX_HOLD_MS);
+                        return 0;
+                    }
+
+                    /* Heap dry for BT_AVSRC_TX_FAILS_MAX polls: drop this
+                     * record WITHOUT advancing time_stamp (wire ts stays
+                     * continuous; only one frame of PCM is lost) and move
+                     * on — freezing the chain would silence the stream. */
+                    s_share_pkt_pending = 0;
+                    s_share_pkt_fails = 0;
+                    break;
+                }
+
+                s_share_pkt_fails = 0;
+                for (U8 j = 0; j < ncopy; j++)
+                {
+                    memcpy(copies[j], pkt_ptr, pkt_len);
+                    av_stream_data_req(inst->con[copy_slot[j]].stream_hdl,
+                                       FALSE,
+                                       FALSE,
+                                       96, //any dynamic PT in the range 96 - 127
+                                       send_ts,
+                                       pkt_len,
+                                       copies[j]); /**/
+                    s_media_req[copy_slot[j]]++;
+                }
+                /* Commit: everything past this point is visible to the
+                 * sinks, so the timestamp advances and the staging slot is
+                 * released exactly here. */
+                inst->time_stamp = send_ts;
+                s_share_pkt_pending = 0;
             }
         }
         while (0);
