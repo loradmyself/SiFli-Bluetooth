@@ -663,19 +663,29 @@ static void *bt_avsrc_media_alloc(rt_size_t size)
 #define BT_AVSRC_TX_EVT_SCHED   (1U << 0)
 #define BT_AVSRC_TX_EVT_STOP    (1U << 1)
 /* Catch-up step after a stall: bounded spacing keeps the RTP cadence even
- * while still refilling the sink's jitter buffer quickly. */
-#define BT_AVSRC_TX_CATCHUP_MS  5
+ * while still refilling the sink's jitter buffer quickly. 2 ms refills a
+ * 4-deep buffer in ~16 ms (was 40 ms at 5 ms steps) so a transient stall
+ * no longer exceeds the sink's 225 ms jitter buffer. */
+#define BT_AVSRC_TX_CATCHUP_MS  2
 #define BT_AVSRC_TX_STACK_SIZE  2048
-/* Credit gate: av_get_stream_buffize() reports the per-stream media FIFO
- * depth (avh_stream_data_req enqueues behind one in-flight L2CA write and
- * every L2CAP data_cfm pops one). Depth >= 3 means >= 4 media packets are
- * already inside the L2CA/HCI/controller pipeline — all four of the
- * controller's ACL buffers' worth, the Frontline "credits: -4" window —
- * so the next copy would only queue behind the connect signaling. Holding
- * here keeps one ACL slot free for AVDTP/HFP signaling, which shortens
- * the connect storm itself. Below the threshold the pump is released on
- * the next poll. */
-#define BT_AVSRC_TX_CREDIT_HOLD 3
+/* Credit gate: av_get_stream_buffize() reads a single global that the
+ * prebuilt stack sets to the media FIFO depth of whichever stream last
+ * queued or dequeued a packet — NOT the combined depth across streams.
+ * With one sink it is accurate; with two sinks it flaps between the two
+ * per-stream depths and undercounts the real pipeline occupancy. The
+ * threshold is therefore tighter (2) as a single-stream guard, and a
+ * combined-pipeline counter below covers the dual-stream case. */
+#define BT_AVSRC_TX_CREDIT_HOLD 2
+/* Combined pipeline budget: the controller has 4 ACL buffers shared
+ * between media and signaling (the Frontline "credits: -4" window). The
+ * gate keeps total media copies in the stack/controller pipeline <= 3,
+ * leaving one slot for AVDTP/HFP signaling — shortening the connect
+ * storm that causes both 丢包 and the connect-window stutter. */
+#define BT_AVSRC_TX_PIPE_MAX    3
+/* Conservative per-copy drain time through L2CA -> HCI -> controller.
+ * At 2-DH5 one ACL slot frees roughly every 1-2 ms; 2 ms is the safe
+ * estimate so the combined counter never undercounts the pipeline. */
+#define BT_AVSRC_TX_DRAIN_MS    2
 /* Poll period while a record is held (credit gate / alloc retry): short
  * enough that releasing is felt within one audio frame slice, long enough
  * not to spin. */
@@ -694,6 +704,24 @@ static volatile uint8_t s_tx_armed = 0;
 static volatile uint8_t s_tx_stop_req = 0;
 static volatile int32_t s_tx_delay_ms = 0;
 static struct rt_ringbuffer32 *s_tx_rb = NULL;
+/* Combined pipeline tracker: counts every media copy handed to
+ * av_stream_data_req (fan-out included) and decays on a conservative
+ * per-copy drain estimate. This is the only reliable multi-stream
+ * signal — see BT_AVSRC_TX_PIPE_MAX above. */
+static U16 s_tx_pipe_copies = 0;
+static U32 s_tx_pipe_tick_ms = 0;
+
+static void bt_avsrc_pipe_decay(void)
+{
+    U32 now = BTS2_GET_TIME();
+    U32 elapsed = now - s_tx_pipe_tick_ms;
+    U16 drained = (U16)(elapsed / BT_AVSRC_TX_DRAIN_MS);
+    if (drained >= s_tx_pipe_copies)
+        s_tx_pipe_copies = 0;
+    else
+        s_tx_pipe_copies -= drained;
+    s_tx_pipe_tick_ms = now;
+}
 
 int bt_avsrc_sharing_armed(void)
 {
@@ -706,6 +734,9 @@ void bt_avsrc_sharing_cancel(void)
      * must not rearm itself through the end-of-pump reschedule. */
     s_tx_stop_req = 1;
     s_tx_armed = 0;
+    /* Pipeline is going away: any copies we counted as in-flight will
+     * never see data_cfm, so reset the combined counter now. */
+    s_tx_pipe_copies = 0;
     if (s_tx_ready)
         rt_event_send(&s_avsrc_tx_evt, BT_AVSRC_TX_EVT_STOP);
 }
@@ -1684,19 +1715,33 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
             U32 rd_len = 0;
             U16 pl;
 
-            /* L1 credit gate: hold the fan-out while the downstream media
-             * pipeline is already carrying >= 4 packets (FIFO depth >= 3
-             * plus the one in-flight L2CA write), i.e. all of the
-             * controller's ACL buffers. Leaving the last slot unused lets
-             * connect signaling through and shortens the air storm that is
-             * the root of the connect-window stutter. The gate runs before
-             * the pacing math so a hold is not counted as one media
-             * period; the FIFO draining below the threshold releases the
-             * pump on the next 1 ms poll. */
-            if (av_get_stream_buffize() >= BT_AVSRC_TX_CREDIT_HOLD)
+            /* L1 credit gate: hold the fan-out while the combined media
+             * pipeline (both streams' FIFOs + L2CA + HCI ACL buffers) is
+             * nearing the controller's 4 ACL buffers. Two signals:
+             *   1. av_get_stream_buffize() — accurate for a single sink;
+             *   2. s_tx_pipe_copies — our combined fan-out counter with
+             *      time-based decay, the only multi-stream signal (the
+             *      prebuilt global only tracks one stream at a time).
+             * The gate runs before the pacing math so a hold is not
+             * counted as one media period; the pipeline draining below
+             * the threshold releases the pump on the next 1 ms poll. */
             {
-                bt_avsrc_sharing_rearm(rb, BT_AVSRC_TX_HOLD_MS);
-                return 0;
+                U8 ncopy_est = 0;
+                for (U8 li = 0; li < MAX_CONNS; li++)
+                {
+                    if (inst->con[li].st == avconned_streaming &&
+                        inst->con[li].cfg == AV_AUDIO_SRC)
+                        ncopy_est++;
+                }
+                bt_avsrc_pipe_decay();
+                U16 pipe_est = (av_get_stream_buffize() > s_tx_pipe_copies)
+                               ? av_get_stream_buffize() : s_tx_pipe_copies;
+                if (pipe_est + ncopy_est > BT_AVSRC_TX_PIPE_MAX ||
+                    av_get_stream_buffize() >= BT_AVSRC_TX_CREDIT_HOLD)
+                {
+                    bt_avsrc_sharing_rearm(rb, BT_AVSRC_TX_HOLD_MS);
+                    return 0;
+                }
             }
 
             /* Pacing tracks committed packets only: a 1 ms retry poll must
@@ -1778,15 +1823,44 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
                 /* Stage one record. It is only "committed" (time_stamp
                  * advanced, staging released) after every sink copy is
                  * handed to av_stream_data_req below. */
-                rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, (U8 *)&pkt_len, sizeof(pkt_len));
+                rt_size_t got;
+                got = rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, (U8 *)&pkt_len, sizeof(pkt_len));
 
-                if ((pkt_len == 0U) || (pkt_len > sizeof(s_share_pkt_buf)))
+                if ((got != sizeof(pkt_len)) ||
+                    (pkt_len == 0U) || (pkt_len > sizeof(s_share_pkt_buf)))
                 {
-                    LOG_D("bad pkt_len %d\n", pkt_len);
+                    LOG_D("bad pkt_len %d (got %d)\n", pkt_len, (int)got);
                     break;
                 }
 
-                rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, s_share_pkt_buf, pkt_len);
+                got = rt_ringbuffer32_get((struct rt_ringbuffer32 *)rb, s_share_pkt_buf, pkt_len);
+                if (got != pkt_len)
+                {
+                    /* Short read: s_share_pkt_buf tail holds stale bytes
+                     * from the previous record. Drop this record — the ring
+                     * was reset or corrupted between the two get() calls. */
+                    LOG_W("share ring short read: want %d got %d\n",
+                          pkt_len, (int)got);
+                    s_share_pkt_pending = 0;
+                    break;
+                }
+
+                /* SBC frames start at AV_FIXED_MEDIA_PKT_HDR_SIZE+1 (13).
+                 * The first SBC byte MUST be the sync word 0x9C. Anything
+                 * else means the record was corrupted in the ring or the
+                 * encoder produced garbage — sending it would make the sink
+                 * emit a loud click (电流音). Drop and log instead. */
+                if (s_share_pkt_buf[AV_FIXED_MEDIA_PKT_HDR_SIZE + 1] != 0x9CU)
+                {
+                    LOG_W("share record SBC sync corrupt: got 0x%02X, "
+                          "len %d, frame_cnt %d\n",
+                          s_share_pkt_buf[AV_FIXED_MEDIA_PKT_HDR_SIZE + 1],
+                          pkt_len,
+                          s_share_pkt_buf[AV_FIXED_MEDIA_PKT_HDR_SIZE]);
+                    s_share_pkt_pending = 0;
+                    break;
+                }
+
                 s_share_pkt_len = pkt_len;
                 s_share_pkt_pending = 1;
             }
@@ -1883,6 +1957,9 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
                                        copies[j]); /**/
                     s_media_req[copy_slot[j]]++;
                 }
+                /* Every copy above is now inside the stack pipeline; the
+                 * combined counter is what the credit gate reads next. */
+                s_tx_pipe_copies += ncopy;
                 /* Commit: everything past this point is visible to the
                  * sinks, so the timestamp advances and the staging slot is
                  * released exactly here. */
