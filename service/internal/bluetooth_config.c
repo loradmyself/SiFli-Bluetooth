@@ -2009,6 +2009,10 @@ static void tl_log_read(uint8_t *bufptr, uint32_t size, bt_eif_callback callback
 
 static void tl_log_write(uint8_t *bufptr, uint32_t size, bt_eif_callback callback, void *dummy)
 {
+    /* Full-rate dump restored 2026-10-23 on request: the 1-in-8 media
+       sampling made captures unusable for SBC analysis. A filtered tap
+       remains a lever for the dump-storm audio noise (A/B confirmed dumps
+       contribute) but must not hide packets from the capture. */
 #ifdef LOG_ON_CONSOLE
     //LOG_I("len %d", size);
     LOG_BIN_MIX(bufptr, size);

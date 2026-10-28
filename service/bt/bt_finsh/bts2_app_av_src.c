@@ -15,6 +15,20 @@
 
 #define MAX_FRM_PER_PAYLOAD 10
 
+#ifdef CFG_AV_SHARING
+/* Dual-stream airtime relief: with two SRC streams the sharing bitpool
+ * (capped only by the negotiated max, 25) drives both links to ~35 x 2-DH5
+ * bursts per second each. The second headset's TWS inter-ear mirror duty
+ * then leaves its own RX windows too fragmented for those 5-slot bursts
+ * and that sink stays silent until the first link is torn down. Cap the
+ * frame bitpool (self-describing per SBC frame, no AVDTP renegotiation)
+ * and pack 7 frames per media packet so one HCI ACL (332 B) fits a single
+ * 2-DH3 burst instead of a 2-DH5: ~30% fewer bytes and ~15% fewer slots
+ * per link, in small bursts that fit fragmented RX windows. */
+#define AV_SHARING_BIT_POOL_MAX 16
+#define AV_SHARING_FRMS_PER_PKT 7
+#endif
+
 //#define AUDIO_DATA_TEST
 //#define AUDIO_DATA_FROM_PSRAM 1
 #ifdef AUDIO_DATA_TEST
@@ -923,6 +937,14 @@ U8 bt_avsrc_prepare_sbc(bts2s_av_inst_data *inst, U8 con_idx)
     {
         cfg->bit_pool = cfg->max_bitpool;
     }
+#ifdef CFG_AV_SHARING
+    /* See AV_SHARING_BIT_POOL_MAX: encode well inside the negotiated
+     * bitpool range so two concurrent streams fit the airtime budget. */
+    if (cfg->bit_pool > AV_SHARING_BIT_POOL_MAX)
+    {
+        cfg->bit_pool = AV_SHARING_BIT_POOL_MAX;
+    }
+#endif
 
     LOG_D("chnl_mode = %d,alloc_method = %d,sample_freq = %d\n", cfg->chnl_mode,
           cfg->alloc_method,
@@ -964,14 +986,45 @@ U8 bt_avsrc_prepare_sbc(bts2s_av_inst_data *inst, U8 con_idx)
     }
 #endif
 
-    bt_avsrc_sbc_lock();
-    cfg->frmsize = bts2_sbc_encode_cfg(cfg->chnl_mode,
-                                       cfg->alloc_method,
-                                       cfg->sample_freq,
-                                       cfg->blocks,
-                                       cfg->subbands,
-                                       cfg->bit_pool);
-    bt_avsrc_sbc_unlock();
+    /* Shared-encoder guard: bts2_sbc_encode_cfg() reinitialises the GLOBAL
+     * SBC encoder (filter-bank reset). When this stream starts while another
+     * SRC stream is already streaming, the share producer is mid-encode with
+     * the running stream's config and the reset would corrupt in-flight
+     * frames on every sink -- the connect-time current noise. In that case
+     * only compute this stream's frame length (pure helper, no encoder
+     * state) and leave the shared encoder alone. */
+    {
+        BOOL encoder_busy = FALSE;
+
+        for (U8 i = 0; i < MAX_CONNS; i++)
+        {
+            if ((i != con_idx) && (inst->con[i].st == avconned_streaming)
+                && (inst->con[i].cfg == AV_AUDIO_SRC))
+            {
+                encoder_busy = TRUE;
+                break;
+            }
+        }
+
+        if (encoder_busy)
+        {
+            cfg->frmsize = bts2_sbc_calculate_framelen(cfg->chnl_mode,
+                                                       cfg->blocks,
+                                                       cfg->subbands,
+                                                       cfg->bit_pool);
+        }
+        else
+        {
+            bt_avsrc_sbc_lock();
+            cfg->frmsize = bts2_sbc_encode_cfg(cfg->chnl_mode,
+                                               cfg->alloc_method,
+                                               cfg->sample_freq,
+                                               cfg->blocks,
+                                               cfg->subbands,
+                                               cfg->bit_pool);
+            bt_avsrc_sbc_unlock();
+        }
+    }
 
     LOG_D("frmsize = %d\n", cfg->frmsize);
 
@@ -983,6 +1036,11 @@ U8 bt_avsrc_prepare_sbc(bts2s_av_inst_data *inst, U8 con_idx)
 
         if (cfg->frms_per_payload > MAX_FRM_PER_PAYLOAD)
             cfg->frms_per_payload = MAX_FRM_PER_PAYLOAD;
+#ifdef CFG_AV_SHARING
+        /* See AV_SHARING_FRMS_PER_PKT: keep the media packet one 2-DH3. */
+        if (cfg->frms_per_payload > AV_SHARING_FRMS_PER_PKT)
+            cfg->frms_per_payload = AV_SHARING_FRMS_PER_PKT;
+#endif
 
         /* calculate the amount of sample bytes used per SBC encode call */
         cfg->bytes_per_encoding = (U16)(cfg->blocks * cfg->chnls * cfg->subbands << 1);
@@ -1063,9 +1121,16 @@ void bt_avsrc_hdl_disc_handler(bts2s_av_inst_data *inst, uint8_t con_idx)
 
     bt_avsrc_set_start_flag(FALSE);
 
-    bt_avsrc_sbc_lock();
-    bts2_sbc_encode_completed();
-    bt_avsrc_sbc_unlock();
+    /* Shared-encoder guard: only tear the encoder down when the LAST SRC
+     * stream is gone (this conn is already st==avdisced, so the count
+     * excludes it). Deinit while another stream still streams is the
+     * disconnect-time current noise on the surviving sink. */
+    if (bt_av_get_src_streaming_number() == 0)
+    {
+        bt_avsrc_sbc_lock();
+        bts2_sbc_encode_completed();
+        bt_avsrc_sbc_unlock();
+    }
 }
 
 
