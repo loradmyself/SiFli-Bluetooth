@@ -1911,19 +1911,52 @@ static uint16_t bt_avsrc_sharing_locked(struct rt_ringbuffer32 *rb)
                 }
 
                 /* SBC frames start at AV_FIXED_MEDIA_PKT_HDR_SIZE+1 (13).
-                 * The first SBC byte MUST be the sync word 0x9C. Anything
-                 * else means the record was corrupted in the ring or the
-                 * encoder produced garbage — sending it would make the sink
-                 * emit a loud click (电流音). Drop and log instead. */
-                if (s_share_pkt_buf[AV_FIXED_MEDIA_PKT_HDR_SIZE + 1] != 0x9CU)
+                 * Every frame — not just the first — must begin with the
+                 * sync word 0x9C. A record whose tail was truncated or
+                 * overwritten mid-encode usually keeps frame 0 intact, so
+                 * the old single-frame check let a mis-aligned tail reach
+                 * the sink and produce the residual 电流音. Drop the whole
+                 * record and let the sink's PLC conceal it instead. */
                 {
-                    LOG_W("share record SBC sync corrupt: got 0x%02X, "
-                          "len %d, frame_cnt %d\n",
-                          s_share_pkt_buf[AV_FIXED_MEDIA_PKT_HDR_SIZE + 1],
-                          pkt_len,
-                          s_share_pkt_buf[AV_FIXED_MEDIA_PKT_HDR_SIZE]);
-                    s_share_pkt_pending = 0;
-                    break;
+                    U8    nb_frm   = s_share_pkt_buf[AV_FIXED_MEDIA_PKT_HDR_SIZE];
+                    U16   frmsize  = act_cfg->frmsize;
+                    U8    bad_frm  = 0xFFU;
+                    U8    bad_byte = 0x00U;
+
+                    if ((frmsize == 0U) || (nb_frm == 0U) ||
+                        (nb_frm > act_cfg->frms_per_payload))
+                    {
+                        bad_frm = 0U;   /* implausible count/size */
+                    }
+                    else
+                    {
+                        for (U8 i = 0U; i < nb_frm; i++)
+                        {
+                            U32 off = (U32)AV_FIXED_MEDIA_PKT_HDR_SIZE + 1U
+                                      + (U32)i * frmsize;
+                            if (off >= (U32)pkt_len)
+                            {
+                                bad_frm = i;       /* truncated half frame */
+                                bad_byte = 0x00U;  /* nothing meaningful */
+                                break;
+                            }
+                            if (s_share_pkt_buf[off] != 0x9CU)
+                            {
+                                bad_frm = i;
+                                bad_byte = s_share_pkt_buf[off];
+                                break;
+                            }
+                        }
+                    }
+
+                    if (bad_frm != 0xFFU)
+                    {
+                        LOG_W("share record SBC sync corrupt: frm[%d] got "
+                              "0x%02X, frmsize %d, frame_cnt %d, len %d\n",
+                              bad_frm, bad_byte, frmsize, nb_frm, pkt_len);
+                        s_share_pkt_pending = 0;
+                        break;
+                    }
                 }
 
                 s_share_pkt_len = pkt_len;
